@@ -1,7 +1,7 @@
 import os
 import json
+import random
 import re
-from datetime import datetime, timezone
 
 import yaml
 from rich.console import Console
@@ -13,7 +13,16 @@ from pocketflow import Node
 from utils.call_llm import call_llm
 from utils.call_llm_stream import call_llm_stream
 from utils.search_web import search_web_raw
+
 AGENT_COLORS = ["cyan", "magenta", "yellow", "green"]
+NOTE_STRATEGIES = [
+    "evidence_challenge",
+    "opposite_defense",
+    "counter_argument",
+    "concession_prompt",
+    "hidden_assumption",
+    "compromise_design",
+]
 console = Console()
 
 
@@ -129,6 +138,8 @@ class ModeratorNode(Node):
         personas_str = "\n".join(
             f"- {p['name']} ({p['role']}) [{p.get('reasoning_approach', 'N/A')}]: {p['perspective']}" for p in personas
 )
+
+        note_strategy = random.choice(NOTE_STRATEGIES)
         conv_str = _conversation_str(conversation)
         speaker_names = [p["name"] for p in personas if p["name"] != last_speaker]
 
@@ -146,7 +157,7 @@ SPEAKER TURNS: {speaker_turns}
 1. NEXT: Pick from [{", ".join(speaker_names)}]. Choose the agent with the FEWEST turns. If tied, pick whose reasoning_approach contrasts most with {last_speaker}.
 2. LOOP: Flag true ONLY if the last 3+ turns restate the SAME specific claim with nearly identical wording. Name the repeated argument. When in doubt, flag false.
 3. DRIFT: Flag true ONLY for 180° reversal from stated perspective. Subtle evolution is NOT drift.
-4. NOTE: If loop is true, write ONE provocative question. VARY your approach each time — do NOT reuse the same template. Rotate through: "What evidence would change your mind?" / "If you had to bet against your own position, what makes you nervous?" / "What's the strongest counter-argument you haven't addressed?" / "Name a specific situation where the other side would be right." / "What hidden assumption are you relying on?" / "What would a compromise look like that neither side has proposed yet?" — pick a DIFFERENT one each turn. Do NOT repeat the same question type twice in a row.
+4. NOTE: If loop is true, write ONE provocative question using strategy: "{note_strategy}". Map: evidence_challenge="What evidence would change your mind?", opposite_defense="If you had to bet against your own position, what makes you nervous?", counter_argument="What's the strongest counter-argument you haven't addressed?", concession_prompt="Name a specific situation where the other side would be right.", hidden_assumption="What hidden assumption are you relying on?", compromise_design="What compromise has neither side proposed?"
 5. RESEARCH: Flag true if an agent makes a specific factual claim that would benefit from web search verification. Use sparingly — max once per debate. If already researched this topic, flag false.
 
 ```yaml
