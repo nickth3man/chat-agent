@@ -12,7 +12,7 @@ from rich.text import Text
 from pocketflow import Node
 from utils.call_llm import call_llm
 from utils.call_llm_stream import call_llm_stream
-
+from utils.search_web import search_web_raw
 AGENT_COLORS = ["cyan", "magenta", "yellow", "green"]
 console = Console()
 
@@ -147,12 +147,14 @@ SPEAKER TURNS: {speaker_turns}
 2. LOOP: Flag true ONLY if the last 3+ turns restate the SAME specific claim with nearly identical wording. Name the repeated argument. When in doubt, flag false.
 3. DRIFT: Flag true ONLY for 180° reversal from stated perspective. Subtle evolution is NOT drift.
 4. NOTE: If loop is true, write ONE provocative question. VARY your approach each time — do NOT reuse the same template. Rotate through: "What evidence would change your mind?" / "If you had to bet against your own position, what makes you nervous?" / "What's the strongest counter-argument you haven't addressed?" / "Name a specific situation where the other side would be right." / "What hidden assumption are you relying on?" / "What would a compromise look like that neither side has proposed yet?" — pick a DIFFERENT one each turn. Do NOT repeat the same question type twice in a row.
+5. RESEARCH: Flag true if an agent makes a specific factual claim that would benefit from web search verification. Use sparingly — max once per debate. If already researched this topic, flag false.
 
 ```yaml
 loop_detected: true/false
 repeated_argument: <what is repeating, or null>
 drift_detected: true/false
 moderator_notes: <provocative question or null>
+research_needed: true/false
 next_speaker: <name>
 should_end: true/false
 reasoning: <1 line>
@@ -210,6 +212,9 @@ reasoning: <1 line>
             })
 
         if shared["turn"] < shared["max_turns"]:
+            if exec_res.get("research_needed", False) and shared.get("research_count", 0) < 2:
+                shared["research_count"] = shared.get("research_count", 0) + 1
+                return "research"
             return "speak"
         return "summarize"
 class AgentSpeakNode(Node):
@@ -227,27 +232,27 @@ class AgentSpeakNode(Node):
             persona = matches[0]
         color_idx = next(i for i, p in enumerate(personas) if p["name"] == persona["name"])
         color = AGENT_COLORS[color_idx % len(AGENT_COLORS)]
+        research_notes = shared.get("research_notes", [])
 
-        return persona, conversation, topic, moderator_notes, color
+        return persona, conversation, topic, moderator_notes, color, research_notes
 
     def exec(self, prep_res):
-        persona, conversation, topic, moderator_notes, color = prep_res
+        persona, conversation, topic, moderator_notes, color, research_notes = prep_res
 
         conv_str = _conversation_str(conversation)
         mod_line = ""
         if moderator_notes:
             mod_line = f"\n[MODERATOR NOTE — follow this guidance: {moderator_notes}]\n"
 
-        prompt = f"""=== PERSONA CARD ===
-You are {persona['name']}, {persona['role']}.
-Stance: {persona['perspective']}
-How you argue: {persona.get('communication_style', 'Direct and plainspoken')}
-Your go-to move: {persona.get('argument_tendency', 'Draws from personal experience')}
-Belief intensity: {persona.get('belief_intensity', 5)}/10
-Reasoning approach: {persona.get('reasoning_approach', 'Context-driven')}
-=== END CARD ===
+        research_line = ""
+        if research_notes:
+            latest = research_notes[-1].get("findings", {})
+            facts_text = str(latest.get("facts", []))[:500]
+            ctx = latest.get("relevant_context", "")
+            if facts_text:
+                research_line = f"\n[FACT-CHECK RESULTS: {facts_text}. Context: {ctx}]\n"
 
-Speak in character — 1-3 paragraphs. Before writing, run this self-check:
+        prompt = f"""=== PERSONA CARD ===
 1. NOVELTY: Am I adding a NEW angle, story, metaphor, or counter-argument? If I'm about to echo, I pivot.
 2. WHY ME: What does MY specific background bring that no one else here can say? Lead with that.
 3. WEAK SPOT: Is there a vulnerability in the last argument I can probe — not attack, but honestly question?
@@ -260,6 +265,7 @@ TOPIC: {topic}
 CONVERSATION:
 {conv_str}
 {mod_line}
+{research_line}
 YOUR THOUGHTS:"""
         full_text = ""
 
@@ -297,6 +303,60 @@ YOUR THOUGHTS:"""
         shared["turn"] += 1
         if "speaker_turns" in shared:
             shared["speaker_turns"][persona["name"]] = shared["speaker_turns"].get(persona["name"], 0) + 1
+        return "continue"
+
+
+class ResearchNode(Node):
+    """Search the web for facts related to the last claim in the debate."""
+
+    def prep(self, shared):
+        conversation = shared["conversation"]
+        last_msg = conversation[-1]["message"] if conversation else ""
+        last_agent = conversation[-1]["agent"] if conversation else ""
+        topic = shared["topic"]
+        return last_msg, last_agent, topic
+
+    def exec(self, prep_res):
+        last_msg, last_agent, topic = prep_res
+
+        query = f"{topic} {last_msg[:200]}"
+        results = search_web_raw(query, max_results=3)
+
+        prompt = f"""Fact-check the following debate claim using these search results.
+
+CLAIM (by {last_agent}):
+{last_msg[:500]}
+
+SEARCH RESULTS:
+{results}
+
+Output YAML:
+```yaml
+facts:
+  - claim: <specific claim being checked>
+    verdict: <supported|contradicted|unverifiable>
+    evidence: <1-2 sentences from search results>
+    source: <URL>
+  - claim: <...>
+    verdict: <...>
+    evidence: <...>
+    source: <...>
+relevant_context: <1 sentence of additional context from search results, or null>
+```"""
+        return call_llm(prompt)
+
+    def exec_fallback(self, prep_res, exc):
+        return None
+
+    def post(self, shared, prep_res, exec_res):
+        if exec_res:
+            data = _parse_yaml(exec_res) if isinstance(exec_res, str) else exec_res
+            if "research_notes" not in shared:
+                shared["research_notes"] = []
+            shared["research_notes"].append({
+                "turn": shared["turn"],
+                "findings": data,
+            })
         return "continue"
 
 

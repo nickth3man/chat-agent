@@ -46,6 +46,8 @@ def main():
         "next_speaker": None,
         "speaker_turns": {},
         "stall_count": 0,
+        "research_count": 0,
+        "research_notes": [],
         "summary": "",
     }
 
