@@ -36,16 +36,9 @@ class InitNode(Node):
         return shared["topic"]
 
     def exec(self, topic):
-        prompt = f"""Create 4 DEBATE personas for the topic: "{topic}"
+        prompt = f"""Create 4 debate personas for: "{topic}"
 
-For each persona, provide these fields:
-  name: Realistic full name (vary gender, age, cultural background)
-  role: Job title, 2-5 words
-  perspective: Their stance on this topic (2-3 sentences). Include WHY they believe this — a value, fear, lived experience, or aspiration that anchors their view.
-  reasoning_approach: One of [Evidence-first, Principle-first, Counterfactual, Systems-thinking]. Each persona must use a DIFFERENT approach.
-  belief_intensity: 1-10 scale. How strongly they hold their view. Spread these out — include at least one 3-4 and one 8-9.
-  communication_style: 1 sentence describing HOW they argue (e.g. "Uses statistics and case studies", "Appeals to moral principles", "Speaks from personal experience", "Challenges assumptions with hypotheticals")
-  argument_tendency: 1 sentence on their go-to move (e.g. "Defaults to historical precedent", "Finds the overlooked stakeholder", "Asks what we're not measuring")
+Each persona needs: name, role (2-5 word job title), perspective (2-3 sentences with belief/fear/aspiration), reasoning_approach (each DIFFERENT: Evidence-first | Principle-first | Counterfactual | Systems-thinking), belief_intensity (1-10, include one 3-4 and one 8-9), communication_style (1 sentence on HOW they argue), argument_tendency (1 sentence on their go-to move).
 
 Output ONLY valid YAML:
 ```yaml
@@ -53,32 +46,32 @@ personas:
   - name: <full name>
     role: <2-5 word job title>
     perspective: <2-3 sentence stance>
-    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
+    reasoning_approach: <pick one, each unique>
     belief_intensity: <1-10>
     communication_style: <1 sentence>
     argument_tendency: <1 sentence>
   - name: <full name>
-    role: <2-5 word job title>
-    perspective: <2-3 sentence stance>
-    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
-    belief_intensity: <1-10>
-    communication_style: <1 sentence>
-    argument_tendency: <1 sentence>
-  - name: <full name>
-    role: <2-5 word job title>
-    perspective: <2-3 sentence stance>
-    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
-    belief_intensity: <1-10>
-    communication_style: <1 sentence>
-    argument_tendency: <1 sentence>
-  - name: <full name>
-    role: <2-5 word job title>
-    perspective: <2-3 sentence stance>
-    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
-    belief_intensity: <1-10>
-    communication_style: <1 sentence>
-    argument_tendency: <1 sentence>
-opening_question: <A provocative question that forces debate. Do not prefix with persona name.>
+    role: <...>
+    perspective: <...>
+    reasoning_approach: <...>
+    belief_intensity: <...>
+    communication_style: <...>
+    argument_tendency: <...>
+  - name: <...>
+    role: <...>
+    perspective: <...>
+    reasoning_approach: <...>
+    belief_intensity: <...>
+    communication_style: <...>
+    argument_tendency: <...>
+  - name: <...>
+    role: <...>
+    perspective: <...>
+    reasoning_approach: <...>
+    belief_intensity: <...>
+    communication_style: <...>
+    argument_tendency: <...>
+opening_question: <provocative question, no name prefix>
 ```"""
         response = call_llm(prompt)
         data = _parse_yaml(response)
@@ -114,7 +107,9 @@ opening_question: <A provocative question that forces debate. Do not prefix with
         shared["last_speaker"] = exec_res["personas"][0]["name"]
         shared["moderator_notes"] = None
         shared["moderator_interventions"] = []
-
+        turns = {p["name"]: 0 for p in exec_res["personas"]}
+        turns[exec_res["personas"][0]["name"]] = 1
+        shared["speaker_turns"] = turns
 
 class ModeratorNode(Node):
     def prep(self, shared):
@@ -125,10 +120,11 @@ class ModeratorNode(Node):
             shared["max_turns"],
             shared["last_speaker"],
             shared["topic"],
+            shared.get("speaker_turns", {}),
         )
 
     def exec(self, prep_res):
-        conversation, personas, turn, max_turns, last_speaker, topic = prep_res
+        conversation, personas, turn, max_turns, last_speaker, topic, speaker_turns = prep_res
 
         personas_str = "\n".join(
             f"- {p['name']} ({p['role']}) [{p.get('reasoning_approach', 'N/A')}]: {p['perspective']}" for p in personas
@@ -145,20 +141,17 @@ CONVERSATION:
 {conv_str}
 TURN: {turn}/{max_turns}
 LAST SPEAKER: {last_speaker}
+SPEAKER TURNS: {speaker_turns}
 
-Analyze:
-1. LOOP: Same argument exchanged 3+ times without new angle? true/false
-2. CONVERGENCE: 2+ agents agree on a specific point? List them.
-3. STALLED: Agent's last 2 responses nearly identical in argument? List names.
-4. DRIFT: Agent made claims TOTALLY OPPOSITE to their stated perspective? Flag true. Not subtle evolution — only 180° reversal.
-5. NEXT: Who speaks next? Choose from: {", ".join(speaker_names)}. Prioritize least-spoken agents whose reasoning_approach differs from {last_speaker}.
-6. NOTE: Only write when loop or stall detected. Make it PROVOCATIVE — a question that forces a new angle. NEVER say "Let's examine" or "Consider". Use: "What's the strongest argument against your own position?" / "If you had to bet on the opposite outcome, what makes you nervous?" / "What evidence would change your mind?" / "Name one thing the other side gets right."
+1. NEXT: Pick from [{", ".join(speaker_names)}]. Choose the agent with the FEWEST turns. If tied, pick whose reasoning_approach contrasts most with {last_speaker}.
+2. LOOP: Flag true ONLY if the SAME precise argument (not similar topic) has been stated 3+ times without new evidence. Name the repeated argument. When in doubt, flag false.
+3. DRIFT: Flag true ONLY for 180° reversal from stated perspective. Subtle evolution is NOT drift.
+4. NOTE: Write a provocative question ONLY if loop is true. Use: "What evidence would change your mind on [X]?" / "Defend the opposite position — what makes you nervous?" / "Name one thing [Z] gets right."
 
 ```yaml
 loop_detected: true/false
+repeated_argument: <what is repeating, or null>
 drift_detected: true/false
-convergence_points: []
-stalled_agents: []
 moderator_notes: <provocative question or null>
 next_speaker: <name>
 should_end: true/false
@@ -171,14 +164,13 @@ reasoning: <1 line>
         return data
 
     def exec_fallback(self, prep_res, exc):
-        conversation, personas, turn, max_turns, last_speaker, topic = prep_res
+        conversation, personas, turn, max_turns, last_speaker, topic, speaker_turns = prep_res
         candidates = [p["name"] for p in personas if p["name"] != last_speaker]
         import random
         return {
             "loop_detected": False,
+            "repeated_argument": None,
             "drift_detected": False,
-            "convergence_points": [],
-            "stalled_agents": [],
             "moderator_notes": None,
             "next_speaker": random.choice(candidates) if candidates else personas[0]["name"],
             "should_end": turn >= max_turns,
@@ -186,7 +178,12 @@ reasoning: <1 line>
         }
 
     def post(self, shared, prep_res, exec_res):
-        shared["next_speaker"] = exec_res["next_speaker"]
+        next_speaker = exec_res["next_speaker"]
+        valid_names = {p["name"] for p in shared["personas"]}
+        if next_speaker not in valid_names:
+            other = [n for n in valid_names if n != shared["last_speaker"]]
+            next_speaker = other[0] if other else shared["last_speaker"]
+        shared["next_speaker"] = next_speaker
         notes = exec_res.get("moderator_notes")
         shared["moderator_notes"] = notes if notes else None
 
@@ -201,8 +198,6 @@ reasoning: <1 line>
         if shared["turn"] < shared["max_turns"]:
             return "speak"
         return "summarize"
-
-
 class AgentSpeakNode(Node):
     def prep(self, shared):
         next_speaker = shared["next_speaker"]
@@ -211,8 +206,12 @@ class AgentSpeakNode(Node):
         topic = shared["topic"]
         moderator_notes = shared.get("moderator_notes")
 
-        persona = next(p for p in personas if p["name"] == next_speaker)
-        color_idx = next(i for i, p in enumerate(personas) if p["name"] == next_speaker)
+        matches = [p for p in personas if p["name"] == next_speaker]
+        if not matches:
+            persona = personas[0]
+        else:
+            persona = matches[0]
+        color_idx = next(i for i, p in enumerate(personas) if p["name"] == persona["name"])
         color = AGENT_COLORS[color_idx % len(AGENT_COLORS)]
 
         return persona, conversation, topic, moderator_notes, color
@@ -282,6 +281,8 @@ YOUR THOUGHTS:"""
         shared["last_speaker"] = persona["name"]
         shared["moderator_notes"] = None
         shared["turn"] += 1
+        if "speaker_turns" in shared:
+            shared["speaker_turns"][persona["name"]] = shared["speaker_turns"].get(persona["name"], 0) + 1
         return "continue"
 
 

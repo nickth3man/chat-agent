@@ -44,6 +44,7 @@ def main():
         "moderator_notes": None,
         "moderator_interventions": [],
         "next_speaker": None,
+        "speaker_turns": {},
         "summary": "",
     }
 
