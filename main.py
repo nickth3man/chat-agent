@@ -45,6 +45,7 @@ def main():
         "moderator_interventions": [],
         "next_speaker": None,
         "speaker_turns": {},
+        "stall_count": 0,
         "summary": "",
     }
 

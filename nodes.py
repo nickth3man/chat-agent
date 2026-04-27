@@ -144,9 +144,9 @@ LAST SPEAKER: {last_speaker}
 SPEAKER TURNS: {speaker_turns}
 
 1. NEXT: Pick from [{", ".join(speaker_names)}]. Choose the agent with the FEWEST turns. If tied, pick whose reasoning_approach contrasts most with {last_speaker}.
-2. LOOP: Flag true ONLY if the SAME precise argument (not similar topic) has been stated 3+ times without new evidence. Name the repeated argument. When in doubt, flag false.
+2. LOOP: Flag true ONLY if the last 3+ turns restate the SAME specific claim with nearly identical wording. Name the repeated argument. When in doubt, flag false.
 3. DRIFT: Flag true ONLY for 180° reversal from stated perspective. Subtle evolution is NOT drift.
-4. NOTE: Write a provocative question ONLY if loop is true. Use: "What evidence would change your mind on [X]?" / "Defend the opposite position — what makes you nervous?" / "Name one thing [Z] gets right."
+4. NOTE: If loop is true, write ONE provocative question. VARY your approach each time — do NOT reuse the same template. Rotate through: "What evidence would change your mind?" / "If you had to bet against your own position, what makes you nervous?" / "What's the strongest counter-argument you haven't addressed?" / "Name a specific situation where the other side would be right." / "What hidden assumption are you relying on?" / "What would a compromise look like that neither side has proposed yet?" — pick a DIFFERENT one each turn. Do NOT repeat the same question type twice in a row.
 
 ```yaml
 loop_detected: true/false
@@ -184,15 +184,29 @@ reasoning: <1 line>
             other = [n for n in valid_names if n != shared["last_speaker"]]
             next_speaker = other[0] if other else shared["last_speaker"]
         shared["next_speaker"] = next_speaker
-        notes = exec_res.get("moderator_notes")
+        loop_detected = exec_res.get("loop_detected", False)
+
+        # Stall counter with hysteresis (MagenticOne pattern)
+        stall = shared.get("stall_count", 0)
+        if loop_detected:
+            stall += 1
+        else:
+            stall = max(0, stall - 1)
+        shared["stall_count"] = stall
+
+        # Only pass notes when stall threshold reached (3+)
+        notes = None
+        if stall >= 3:
+            notes = exec_res.get("moderator_notes")
         shared["moderator_notes"] = notes if notes else None
 
         if notes:
             shared["moderator_interventions"].append({
                 "turn": shared["turn"],
-                "loop_detected": exec_res.get("loop_detected", False),
+                "loop_detected": loop_detected,
                 "drift_detected": exec_res.get("drift_detected", False),
                 "note": notes,
+                "stall_count": stall,
             })
 
         if shared["turn"] < shared["max_turns"]:
