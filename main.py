@@ -1,17 +1,58 @@
-from flow import create_qa_flow
+from dotenv import load_dotenv
+load_dotenv()
 
-# Example main function
-# Please replace this with your own main function
+import os
+import sys
+
+from rich.console import Console
+from rich.prompt import Prompt
+
+from flow import create_conversation_flow
+
+
 def main():
+    console = Console()
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        console.print("[red]ERROR: OPENROUTER_API_KEY environment variable not set.[/red]")
+        console.print("Set it with: [bold]export OPENROUTER_API_KEY=your-key-here[/bold]")
+        sys.exit(1)
+
+    model = os.environ.get("LLM_MODEL", "google/gemini-2.5-flash")
+    console.print(f"[dim]Using model: {model}[/dim]")
+    console.print()
+
+    topic = Prompt.ask("[bold]Enter a conversation topic[/bold]")
+    if not topic.strip():
+        console.print("[red]Topic cannot be empty.[/red]")
+        sys.exit(1)
+
+    max_turns_raw = os.environ.get("MAX_TURNS", "50")
+    try:
+        max_turns = int(max_turns_raw)
+    except ValueError:
+        max_turns = 50
+
     shared = {
-        "question": "In one sentence, what's the end of universe?",
-        "answer": None
+        "topic": topic.strip(),
+        "personas": [],
+        "conversation": [],
+        "turn": 0,
+        "max_turns": max_turns,
+        "last_speaker": None,
+        "moderator_notes": None,
+        "moderator_interventions": [],
+        "next_speaker": None,
+        "summary": "",
     }
 
-    qa_flow = create_qa_flow()
-    qa_flow.run(shared)
-    print("Question:", shared["question"])
-    print("Answer:", shared["answer"])
+    flow = create_conversation_flow()
+    console.print(f"[dim]Generating personas and starting {max_turns}-turn conversation...[/dim]")
+    console.print()
+
+    flow.run(shared)
+
 
 if __name__ == "__main__":
     main()
