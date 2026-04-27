@@ -36,43 +36,71 @@ class InitNode(Node):
         return shared["topic"]
 
     def exec(self, topic):
-        prompt = f"""Generate 4 random personas for a conversation. Each persona should have a name, role, and perspective. The personas must be diverse, creative, and engaging — NOT tied to any specific topic.
+        prompt = f"""Create 4 DEBATE personas for the topic: "{topic}"
 
-Also, generate a thought-provoking 1-2 sentence opening QUESTION from the first persona about this topic: "{topic}"
+For each persona, provide these fields:
+  name: Realistic full name (vary gender, age, cultural background)
+  role: Job title, 2-5 words
+  perspective: Their stance on this topic (2-3 sentences). Include WHY they believe this — a value, fear, lived experience, or aspiration that anchors their view.
+  reasoning_approach: One of [Evidence-first, Principle-first, Counterfactual, Systems-thinking]. Each persona must use a DIFFERENT approach.
+  belief_intensity: 1-10 scale. How strongly they hold their view. Spread these out — include at least one 3-4 and one 8-9.
+  communication_style: 1 sentence describing HOW they argue (e.g. "Uses statistics and case studies", "Appeals to moral principles", "Speaks from personal experience", "Challenges assumptions with hypotheticals")
+  argument_tendency: 1 sentence on their go-to move (e.g. "Defaults to historical precedent", "Finds the overlooked stakeholder", "Asks what we're not measuring")
 
-Output in YAML:
+Output ONLY valid YAML:
 ```yaml
 personas:
-  - name: <name>
-    role: <role>
-    perspective: <perspective>
-  - name: <name>
-    role: <role>
-    perspective: <perspective>
-  - name: <name>
-    role: <role>
-    perspective: <perspective>
-  - name: <name>
-    role: <role>
-    perspective: <perspective>
-opening_question: <question from persona 0, do NOT prefix with the name>
+  - name: <full name>
+    role: <2-5 word job title>
+    perspective: <2-3 sentence stance>
+    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
+    belief_intensity: <1-10>
+    communication_style: <1 sentence>
+    argument_tendency: <1 sentence>
+  - name: <full name>
+    role: <2-5 word job title>
+    perspective: <2-3 sentence stance>
+    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
+    belief_intensity: <1-10>
+    communication_style: <1 sentence>
+    argument_tendency: <1 sentence>
+  - name: <full name>
+    role: <2-5 word job title>
+    perspective: <2-3 sentence stance>
+    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
+    belief_intensity: <1-10>
+    communication_style: <1 sentence>
+    argument_tendency: <1 sentence>
+  - name: <full name>
+    role: <2-5 word job title>
+    perspective: <2-3 sentence stance>
+    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
+    belief_intensity: <1-10>
+    communication_style: <1 sentence>
+    argument_tendency: <1 sentence>
+opening_question: <A provocative question that forces debate. Do not prefix with persona name.>
 ```"""
         response = call_llm(prompt)
         data = _parse_yaml(response)
         if "personas" not in data or "opening_question" not in data:
             raise ValueError(f"Invalid init response: {response}")
         for p in data["personas"]:
-            if not all(k in p for k in ("name", "role", "perspective")):
+            required = ("name", "role", "perspective", "reasoning_approach", "belief_intensity", "communication_style", "argument_tendency")
+            if not all(k in p for k in required):
                 raise ValueError(f"Persona missing required fields: {p}")
+            if len(str(p.get("role", ""))) < 2 or len(str(p.get("role", ""))) > 60:
+                raise ValueError(f"Persona role must be 2-60 chars (job title): {p}")
+            if len(str(p.get("perspective", ""))) < 15:
+                raise ValueError(f"Persona perspective too short (<15 chars): {p}")
         return data
 
     def exec_fallback(self, prep_res, exc):
         return {
             "personas": [
-                {"name": "Alex", "role": "technologist", "perspective": "optimistic"},
-                {"name": "Jordan", "role": "philosopher", "perspective": "skeptical"},
-                {"name": "Sam", "role": "pragmatist", "perspective": "practical"},
-                {"name": "Riley", "role": "visionary", "perspective": "idealistic"},
+                {"name": "Alex", "role": "Techno-Optimist", "perspective": "Technology will solve humanity's biggest problems if we embrace innovation without fear. We need less regulation, not more.", "reasoning_approach": "Evidence-first", "belief_intensity": 8, "communication_style": "Cites historical tech breakthroughs as proof of pattern", "argument_tendency": "Compares regulatory pushback to past Luddite movements"},
+                {"name": "Jordan", "role": "Ethics Professor", "perspective": "I've studied how unchecked technology erodes social trust and privacy. We need strong oversight and democratic control over AI and automation.", "reasoning_approach": "Principle-first", "belief_intensity": 7, "communication_style": "Grounds arguments in ethical frameworks and historical harms", "argument_tendency": "Asks who bears the cost when things go wrong"},
+                {"name": "Sam", "role": "Small Business Owner", "perspective": "When regulations pile up, small businesses suffer most. I need practical rules, not utopian ideals. Show me what works for real people.", "reasoning_approach": "Counterfactual", "belief_intensity": 5, "communication_style": "Speaks from personal experience running a business", "argument_tendency": "Tests proposals against reality: 'Would this actually work on Main Street?'"},
+                {"name": "Riley", "role": "Futurist & Artist", "perspective": "We keep talking as if the future is something happening TO us. What if WE designed it instead? Let's imagine radically different systems, not just tweak the current ones.", "reasoning_approach": "Systems-thinking", "belief_intensity": 6, "communication_style": "Uses metaphor and reframing to shift perspective", "argument_tendency": "Identifies the assumption nobody is questioning"},
             ],
             "opening_question": f"What do you think about {prep_res}?",
         }
@@ -103,36 +131,38 @@ class ModeratorNode(Node):
         conversation, personas, turn, max_turns, last_speaker, topic = prep_res
 
         personas_str = "\n".join(
-            f"- {p['name']} ({p['role']}): {p['perspective']}" for p in personas
-        )
+            f"- {p['name']} ({p['role']}) [{p.get('reasoning_approach', 'N/A')}]: {p['perspective']}" for p in personas
+)
         conv_str = _conversation_str(conversation)
         speaker_names = [p["name"] for p in personas if p["name"] != last_speaker]
 
-        prompt = f"""You are a strict conversation moderator. Your job is to prevent the conversation from becoming repetitive or going in circles.
+        prompt = f"""Moderate this debate. Output YAML only.
 
 TOPIC: {topic}
-
 PERSONAS:
 {personas_str}
-
-FULL CONVERSATION HISTORY:
+CONVERSATION:
 {conv_str}
-
-CURRENT TURN: {turn}/{max_turns}
+TURN: {turn}/{max_turns}
 LAST SPEAKER: {last_speaker}
 
-CRITICAL ANALYSIS:
-1. LOOP DETECTION: Compare the last 5+ messages. Are they saying the same things with different words? Are the same keywords, metaphors, or phrases being recycled? If the conversation feels stagnant or circular, set loop_detected: true and provide a moderator_notes that forcefully redirects to a COMPLETELY NEW angle, subtopic, or question about the topic.
-2. DRIFT DETECTION: Are any agents saying things completely inconsistent with their persona's role or perspective? If so, set drift_detected: true.
-3. NEXT SPEAKER: Pick who speaks next. Must NOT be {last_speaker}. Choose from: {", ".join(speaker_names)}. Favor agents who have spoken less OR whose unique perspective would add the most FRESH value.
+Analyze:
+1. LOOP: Same argument exchanged 3+ times without new angle? true/false
+2. CONVERGENCE: 2+ agents agree on a specific point? List them.
+3. STALLED: Agent's last 2 responses nearly identical in argument? List names.
+4. DRIFT: Agent made claims TOTALLY OPPOSITE to their stated perspective? Flag true. Not subtle evolution — only 180° reversal.
+5. NEXT: Who speaks next? Choose from: {", ".join(speaker_names)}. Prioritize least-spoken agents whose reasoning_approach differs from {last_speaker}.
+6. NOTE: Only write when loop or stall detected. Make it PROVOCATIVE — a question that forces a new angle. NEVER say "Let's examine" or "Consider". Use: "What's the strongest argument against your own position?" / "If you had to bet on the opposite outcome, what makes you nervous?" / "What evidence would change your mind?" / "Name one thing the other side gets right."
 
-Output ONLY valid YAML:
 ```yaml
 loop_detected: true/false
 drift_detected: true/false
-moderator_notes: <one specific sentence redirecting to a new angle or subtopic, or null>
+convergence_points: []
+stalled_agents: []
+moderator_notes: <provocative question or null>
 next_speaker: <name>
-reasoning: <brief reason>
+should_end: true/false
+reasoning: <1 line>
 ```"""
         response = call_llm(prompt)
         data = _parse_yaml(response)
@@ -147,8 +177,11 @@ reasoning: <brief reason>
         return {
             "loop_detected": False,
             "drift_detected": False,
+            "convergence_points": [],
+            "stalled_agents": [],
             "moderator_notes": None,
             "next_speaker": random.choice(candidates) if candidates else personas[0]["name"],
+            "should_end": turn >= max_turns,
             "reasoning": "fallback random selection",
         }
 
@@ -192,16 +225,29 @@ class AgentSpeakNode(Node):
         if moderator_notes:
             mod_line = f"\n[MODERATOR NOTE — follow this guidance: {moderator_notes}]\n"
 
-        prompt = f"""INSTRUCTION:
-You are {persona['name']}, {persona['role']}. Your perspective: {persona['perspective']}.
-Write a 1-3 paragraph response in character. Be conversational. Engage directly with what previous speakers said. Do NOT repeat points already made. Do NOT prefix with your name. Do NOT include meta-commentary, instructions, or labels in your response — output ONLY the message content.
+        prompt = f"""=== PERSONA CARD ===
+You are {persona['name']}, {persona['role']}.
+Stance: {persona['perspective']}
+How you argue: {persona.get('communication_style', 'Direct and plainspoken')}
+Your go-to move: {persona.get('argument_tendency', 'Draws from personal experience')}
+Belief intensity: {persona.get('belief_intensity', 5)}/10
+Reasoning approach: {persona.get('reasoning_approach', 'Context-driven')}
+=== END CARD ===
+
+Speak in character — 1-3 paragraphs. Before writing, run this self-check:
+1. NOVELTY: Am I adding a NEW angle, story, metaphor, or counter-argument? If I'm about to echo, I pivot.
+2. WHY ME: What does MY specific background bring that no one else here can say? Lead with that.
+3. WEAK SPOT: Is there a vulnerability in the last argument I can probe — not attack, but honestly question?
+
+Output only your message. No name prefix. No bullet points. No sign-offs.
+Vary sentence rhythm — short. Then longer, building. Then short again.
 
 TOPIC: {topic}
 
-CONVERSATION SO FAR:
+CONVERSATION:
 {conv_str}
 {mod_line}
-YOUR RESPONSE (as {persona['name']}, message content only):"""
+YOUR THOUGHTS:"""
         full_text = ""
 
         with Live(
@@ -262,22 +308,36 @@ class SummarizerNode(Node):
         if len(conv_str) > 8000:
             conv_str = conv_str[:8000] + "\n[... truncated for length ...]"
 
-        prompt = f"""Summarize the following multi-agent conversation.
+        prompt = f"""Analyze and summarize this multi-agent debate. Focus on substance, not speakers.
 
 TOPIC: {topic}
-
 PERSONAS:
 {personas_str}
-
-CONVERSATION (first 10 and last 15 messages):
+CONVERSATION:
 {conv_str}
 
-Provide a structured summary:
-- Key takeaways (3-5 bullet points)
-- Points of agreement among the agents
-- Points of disagreement
-- Notable insights or surprising moments
-- Overall arc and conclusion of the conversation"""
+=== DEBATE SUMMARY ===
+
+## Core Positions
+For each agent, state their opening stance and how it held up or shifted:
+
+## Convergence Points
+Where 2+ agents agreed or found common ground. If none, say "No consensus emerged."
+
+## Key Divergences (3 max)
+The most significant unresolved disagreements. For each: the claim, the competing positions, and the core reason they couldn't reconcile. Focus on IDEAS, not personalities.
+
+## Novel Insights
+What emerged from the DEBATE ITSELF — ideas not present in anyone's opening stance. If the debate generated nothing new, say so honestly.
+
+## Surprising Moments
+1-2 quotes or moments that shifted the debate's direction or reframed the question.
+
+## The Arc
+How positions evolved from start to finish. Did anyone concede? Did debate reveal a deeper question beneath the surface?
+
+## Overall Takeaway
+2-3 sentences. What does this debate tell us about the topic that a single perspective would miss?"""
         return call_llm(prompt)
 
     def exec_fallback(self, prep_res, exc):
