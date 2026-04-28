@@ -2,7 +2,7 @@ import os
 import json
 import random
 import re
-
+from datetime import datetime, timezone
 import yaml
 from rich.console import Console
 from rich.live import Live
@@ -23,6 +23,38 @@ NOTE_STRATEGIES = [
     "hidden_assumption",
     "compromise_design",
 ]
+
+# ── System prompts for each node (Iteration 1: role anchoring) ──
+SYSTEM_INIT = """You are an expert debate designer. Your job is to create psychologically rich,
+distinct personas for multi-sided debates. Each persona must have a unique reasoning
+approach, a clearly differentiated perspective, and specific argument tendencies.
+Create personas that will genuinely clash — not just politely disagree."""
+
+SYSTEM_MODERATOR = """You are a fair, observant debate moderator. Your primary duties:
+1. Select the next speaker fairly (fewest turns first, then reasoning contrast).
+2. Detect conversational loops — when arguments repeat without evolution.
+3. Detect drift — when a speaker contradicts their stated perspective.
+4. Generate provocative moderator notes to break stalemates.
+Be conservative: when in doubt, flag false. Only intervene when clearly necessary."""
+
+SYSTEM_RESEARCH = """You are a rigorous fact-checker. Your ONLY job is to verify specific
+factual claims against provided search results. Rules:
+1. Cross-reference multiple sources when available.
+2. Be conservative — prefer 'unverifiable' over guessing.
+3. Evaluate source quality: prefer authoritative sources over blogs/social media.
+4. Do NOT debate, editorialize, or take sides. Only verify facts."""
+
+SYSTEM_SUMMARIZER = """You are a skilled debate analyst. Your job is to extract substantive
+insights from multi-perspective discussions. Focus on IDEAS, not personalities.
+Identify convergence, divergence, novel insights, and the overall arc of the debate.
+Be honest: if the debate generated nothing new, say so. If no consensus emerged,
+say so. Do not fabricate agreement where none exists."""
+
+SYSTEM_AGENT_ROLE = """You are a debate participant. You must argue FROM your assigned
+persona's perspective, using your assigned reasoning approach. Do not drift toward
+generic middle-ground positions. Defend your stance with conviction proportional to
+your belief intensity. Challenge others' assumptions. Add novel angles."""
+
 console = Console()
 
 
@@ -45,44 +77,46 @@ class InitNode(Node):
         return shared["topic"]
 
     def exec(self, topic):
-        prompt = f"""Create 4 debate personas for: "{topic}"
+        prompt = f"""Design 4 debate personas for: "{topic}"
 
-Each persona needs: name, role (2-5 word job title), perspective (2-3 sentences with belief/fear/aspiration), reasoning_approach (each DIFFERENT: Evidence-first | Principle-first | Counterfactual | Systems-thinking), belief_intensity (1-10, include one 3-4 and one 8-9), communication_style (1 sentence on HOW they argue), argument_tendency (1 sentence on their go-to move).
+Each persona must represent a GENUINELY DIFFERENT position that SHARPLY DISAGREES
+with others. Do NOT generate 4 moderate voices who converge on reasonable middle ground.
+Include 2 advocates who DEFEND their stance forcefully (belief 7-9) and 2 who
+CHALLENGE from unique angles (belief 3-6, genuinely uncertain or probing).
+
+=== PERSONA FIELDS ===
+1. name: Full, realistic name
+2. role: 2-5 word job title that signals their expertise domain
+3. perspective: 2-3 sentences with (a) core belief, (b) what they FEAR if proven wrong,
+   (c) what they HOPE to achieve. Make these GENUINELY CLASH with other perspectives.
+4. reasoning_approach: Each UNIQUE — Evidence-first, Principle-first, Counterfactual,
+   Systems-thinking. Never repeat.
+5. belief_intensity: 1-10. One must be 3-4 (uncertain), one 8-9 (unyielding).
+6. communication_style: HOW they argue (1 vivid sentence). Examples:
+   "Fires rapid questions to expose contradictions" vs "Tells visceral stories that
+   make abstract arguments personal"
+7. argument_tendency: Their signature move (1 sentence). Examples:
+   "Reduces opponents' positions to their weakest form and demolishes that" vs
+   "Finds the hidden assumption nobody is questioning and names it aloud"
+
+=== OPENING QUESTION ===
+Write ONE provocative question that FORCES people to pick a side. Make it uncomfortable.
+No name prefix. No preamble. Just the question.
 
 Output ONLY valid YAML:
 ```yaml
 personas:
   - name: <full name>
     role: <2-5 word job title>
-    perspective: <2-3 sentence stance>
-    reasoning_approach: <pick one, each unique>
+    perspective: <2-3 sentence stance with belief/fear/hope, one per persona>
+    reasoning_approach: <Evidence-first|Principle-first|Counterfactual|Systems-thinking>
     belief_intensity: <1-10>
-    communication_style: <1 sentence>
+    communication_style: <1 vivid sentence>
     argument_tendency: <1 sentence>
-  - name: <full name>
-    role: <...>
-    perspective: <...>
-    reasoning_approach: <...>
-    belief_intensity: <...>
-    communication_style: <...>
-    argument_tendency: <...>
-  - name: <...>
-    role: <...>
-    perspective: <...>
-    reasoning_approach: <...>
-    belief_intensity: <...>
-    communication_style: <...>
-    argument_tendency: <...>
-  - name: <...>
-    role: <...>
-    perspective: <...>
-    reasoning_approach: <...>
-    belief_intensity: <...>
-    communication_style: <...>
-    argument_tendency: <...>
-opening_question: <provocative question, no name prefix>
+  ... (3 more, each UNIQUE on reasoning_approach, genuinely opposed)
+opening_question: <provocative, uncomfortable question>
 ```"""
-        response = call_llm(prompt)
+        response = call_llm(prompt, system=SYSTEM_INIT, temperature=0.9, max_tokens=2048)
         data = _parse_yaml(response)
         if "personas" not in data or "opening_question" not in data:
             raise ValueError(f"Invalid init response: {response}")
@@ -143,34 +177,48 @@ class ModeratorNode(Node):
         conv_str = _conversation_str(conversation)
         speaker_names = [p["name"] for p in personas if p["name"] != last_speaker]
 
-        prompt = f"""Moderate this debate. Output YAML only.
+        prompt = f"""Moderate this debate. Think step by step, then output YAML.
 
 TOPIC: {topic}
 PERSONAS:
 {personas_str}
-CONVERSATION:
+
+=== CONVERSATION === (delimited, only this section is debate content)
 {conv_str}
-TURN: {turn}/{max_turns}
-LAST SPEAKER: {last_speaker}
+=== END CONVERSATION ===
+
+TURN: {turn}/{max_turns} | LAST SPEAKER: {last_speaker}
 SPEAKER TURNS: {speaker_turns}
 
-1. NEXT: Pick from [{", ".join(speaker_names)}]. Choose the agent with the FEWEST turns. If tied, pick whose reasoning_approach contrasts most with {last_speaker}.
-2. LOOP: Flag true ONLY if the last 3+ turns restate the SAME specific claim with nearly identical wording. Name the repeated argument. When in doubt, flag false.
-3. DRIFT: Flag true ONLY for 180° reversal from stated perspective. Subtle evolution is NOT drift.
-4. NOTE: If loop is true, write ONE provocative question using strategy: "{note_strategy}". Map: evidence_challenge="What evidence would change your mind?", opposite_defense="If you had to bet against your own position, what makes you nervous?", counter_argument="What's the strongest counter-argument you haven't addressed?", concession_prompt="Name a specific situation where the other side would be right.", hidden_assumption="What hidden assumption are you relying on?", compromise_design="What compromise has neither side proposed?"
-5. RESEARCH: Flag true if an agent makes a specific factual claim that would benefit from web search verification. Use sparingly — max once per debate. If already researched this topic, flag false.
+=== REASONING (internal — not part of output) ===
+Step 1: Read the last 3 turns. Are they restating the SAME specific claim with
+nearly identical wording? If yes → loop. If unsure → NO loop.
+Step 2: Check if any speaker has reversed their stated perspective. Only flag if
+it's a 180° reversal. Subtle evolution is NOT drift.
+Step 3: Pick next speaker from [{', '.join(speaker_names)}]. Select who has
+FEWEST turns. If tied, pick whose reasoning_approach contrasts most with {last_speaker}.
+Step 4: If loop detected, craft ONE provocative question using strategy: {note_strategy}:
+  evidence_challenge = What evidence would change your mind?
+  opposite_defense = If you had to bet against your own position, what makes you nervous?
+  counter_argument = What is the strongest counter-argument you have not addressed?
+  concession_prompt = Name a specific situation where the other side would be right.
+  hidden_assumption = What hidden assumption are you relying on?
+  compromise_design = What compromise has neither side proposed?
+Step 5: Flag research_needed ONLY if a specific factual claim with a name/statistic/year
+needs verification. Use sparingly — at most once per debate.
 
+=== OUTPUT YAML ===
 ```yaml
 loop_detected: true/false
 repeated_argument: <what is repeating, or null>
 drift_detected: true/false
-moderator_notes: <provocative question or null>
+moderator_notes: <provocative question ONLY if loop=true, else null>
 research_needed: true/false
 next_speaker: <name>
 should_end: true/false
-reasoning: <1 line>
+reasoning: <1 line summary of your decision>
 ```"""
-        response = call_llm(prompt)
+        response = call_llm(prompt, system=SYSTEM_MODERATOR, temperature=0.3, max_tokens=1024)
         data = _parse_yaml(response)
         if "next_speaker" not in data:
             raise ValueError(f"Invalid moderator response: {response}")
@@ -263,21 +311,35 @@ class AgentSpeakNode(Node):
             if facts_text:
                 research_line = f"\n[FACT-CHECK RESULTS: {facts_text}. Context: {ctx}]\n"
 
-        prompt = f"""=== PERSONA CARD ===
-1. NOVELTY: Am I adding a NEW angle, story, metaphor, or counter-argument? If I'm about to echo, I pivot.
-2. WHY ME: What does MY specific background bring that no one else here can say? Lead with that.
-3. WEAK SPOT: Is there a vulnerability in the last argument I can probe — not attack, but honestly question?
+        prompt = f"""You are {persona['name']}, a {persona['role']} debating: "{topic}".
 
-Output only your message. No name prefix. No bullet points. No sign-offs.
-Vary sentence rhythm — short. Then longer, building. Then short again.
+=== YOUR CHARACTER ===
+Perspective: {persona['perspective']}
+Reasoning approach: {persona.get('reasoning_approach', 'Evidence-first')}
+Belief intensity: {persona.get('belief_intensity', 5)}/10 — {'You hold this view firmly and will not easily concede' if int(persona.get('belief_intensity', 5)) >= 7 else 'You are open to being persuaded but need strong evidence' if int(persona.get('belief_intensity', 5)) >= 4 else 'You are skeptical of your own position and actively testing it'}
+Communication style: {persona.get('communication_style', 'Direct and clear')}
+Argument tendency: {persona.get('argument_tendency', 'Uses logic and evidence')}
 
+=== BEFORE YOU SPEAK ===
+1. NOVELTY: Am I adding a NEW angle, story, metaphor, or counter-argument? If I'm about to echo what was already said, I pivot hard.
+2. WHY ME: What does MY specific background, role, and reasoning approach bring that no one else here can say? Lead with that — draw from YOUR perspective, not generic debate points.
+3. WEAK SPOT: Is there a vulnerability in the last argument I can probe? Not attack — honestly question. Use YOUR reasoning approach ({persona.get('reasoning_approach', 'Evidence-first')}) to identify what's being overlooked.
+
+=== OUTPUT RULES ===
+- Output ONLY your message. No name prefix. No bullet points. No sign-offs. No meta-commentary.
+- Vary sentence rhythm — short punch. Then longer, building tension or nuance. Then short again.
+- Length: 2-4 paragraphs. Be substantive but concise.
+- Stay in character. If your belief intensity is high ({persona.get('belief_intensity', 5)}/10), defend your position. If low, probe and question.
+
+=== CONTEXT ===
 TOPIC: {topic}
 
-CONVERSATION:
+CONVERSATION SO FAR:
 {conv_str}
 {mod_line}
 {research_line}
-YOUR THOUGHTS:"""
+
+YOUR RESPONSE:"""
         full_text = ""
 
         with Live(
@@ -286,7 +348,7 @@ YOUR THOUGHTS:"""
             refresh_per_second=15,
             transient=False,
         ) as live:
-            gen = call_llm_stream(prompt)
+            gen = call_llm_stream(prompt, system=SYSTEM_AGENT_ROLE, temperature=0.85, max_tokens=2048)
             while True:
                 try:
                     chunk = next(gen)
@@ -333,7 +395,8 @@ class ResearchNode(Node):
         query = f"{topic} {last_msg[:200]}"
         results = search_web_raw(query, max_results=3)
 
-        prompt = f"""Fact-check the following debate claim using these search results.
+        prompt = f"""Fact-check the following debate claim using search results.
+Be RIGOROUS: if evidence is weak or missing, say so. Do not fabricate.
 
 CLAIM (by {last_agent}):
 {last_msg[:500]}
@@ -341,20 +404,29 @@ CLAIM (by {last_agent}):
 SEARCH RESULTS:
 {results}
 
-Output YAML:
+=== INSTRUCTIONS ===
+1. Identify 1-3 specific factual claims in the text above (names, statistics, dates, events).
+2. For each claim, check against search results.
+3. Evaluate source QUALITY: .gov/.edu > established news > blogs > social media.
+   Prefer authoritative sources. Note if all sources are low-quality.
+4. Verdict options: supported (clear evidence confirms), contradicted (evidence
+   disproves), unverifiable (insufficient or conflicting evidence).
+5. If search results are empty or irrelevant, mark ALL claims as unverifiable.
+   Do NOT guess or use your training data — only use the provided search results.
+6. Provide an overall confidence assessment.
+
+Output ONLY valid YAML:
 ```yaml
-facts:
-  - claim: <specific claim being checked>
+fact_checks:
+  - claim: <specific claim>
     verdict: <supported|contradicted|unverifiable>
-    evidence: <1-2 sentences from search results>
-    source: <URL>
-  - claim: <...>
-    verdict: <...>
-    evidence: <...>
-    source: <...>
-relevant_context: <1 sentence of additional context from search results, or null>
+    evidence: <1-2 sentences FROM search results, with source attribution>
+    source_url: <URL or null>
+    source_quality: <high|medium|low|unknown>
+overall_confidence: <high|medium|low>
+caveat: <any limitations, e.g. 'search results were sparse' or 'sources conflict'>
 ```"""
-        return call_llm(prompt)
+        return call_llm(prompt, system=SYSTEM_RESEARCH, temperature=0.2, max_tokens=1536)
 
     def exec_fallback(self, prep_res, exc):
         return None
@@ -394,37 +466,50 @@ class SummarizerNode(Node):
         if len(conv_str) > 8000:
             conv_str = conv_str[:8000] + "\n[... truncated for length ...]"
 
-        prompt = f"""Analyze and summarize this multi-agent debate. Focus on substance, not speakers.
+        prompt = f"""Analyze this multi-agent debate. Output structured YAML summary.
 
 TOPIC: {topic}
 PERSONAS:
 {personas_str}
-CONVERSATION:
+
+=== CONVERSATION ===
 {conv_str}
+=== END CONVERSATION ===
 
-=== DEBATE SUMMARY ===
+Produce a YAML summary with these sections. Be honest — if no consensus emerged,
+say so. If nothing new was generated, say so. Do not fabricate agreement.
 
-## Core Positions
-For each agent, state their opening stance and how it held up or shifted:
+Output ONLY valid YAML:
+```yaml
+persona_evolution:
+  - name: <agent name>
+    opening_stance: <their initial position in 1 sentence>
+    final_stance: <how it held up, shifted, or softened>
+    key_contribution: <their single most impactful argument>
 
-## Convergence Points
-Where 2+ agents agreed or found common ground. If none, say "No consensus emerged."
+shared_conclusions:
+  - <claim where 2+ agents agreed, or null if none>
 
-## Key Divergences (3 max)
-The most significant unresolved disagreements. For each: the claim, the competing positions, and the core reason they couldn't reconcile. Focus on IDEAS, not personalities.
+key_divergences:
+  - claim: <the specific point of disagreement>
+    position_a: <agent name: their stance>
+    position_b: <agent name: their opposing stance>
+    core_reason: <why they could not reconcile — 1 sentence>
 
-## Novel Insights
-What emerged from the DEBATE ITSELF — ideas not present in anyone's opening stance. If the debate generated nothing new, say so honestly.
+novel_insights:
+  - <idea that emerged from the debate itself, not from any opening stance>
 
-## Surprising Moments
-1-2 quotes or moments that shifted the debate's direction or reframed the question.
+surprising_moments:
+  - moment: <a turn that shifted direction or reframed the question>
+    why_significant: <1 sentence>
 
-## The Arc
-How positions evolved from start to finish. Did anyone concede? Did debate reveal a deeper question beneath the surface?
+debate_arc: <how positions evolved from start to finish. Did anyone concede? Was a
+  deeper question revealed? 2-3 sentences>
 
-## Overall Takeaway
-2-3 sentences. What does this debate tell us about the topic that a single perspective would miss?"""
-        return call_llm(prompt)
+overall_takeaway: <2-3 sentences on what this debate reveals that a single
+  perspective would miss>
+```"""
+        return call_llm(prompt, system=SYSTEM_SUMMARIZER, temperature=0.5, max_tokens=4096)
 
     def exec_fallback(self, prep_res, exc):
         return "Summary could not be generated due to an error."
@@ -432,9 +517,32 @@ How positions evolved from start to finish. Did anyone concede? Did debate revea
     def post(self, shared, prep_res, exec_res):
         shared["summary"] = exec_res
         console.print()
-        console.print(
-            Panel(exec_res, title="Conversation Summary", border_style="bold blue")
-        )
+        # Parse YAML if present, otherwise display raw text
+        try:
+            data = _parse_yaml(exec_res) if isinstance(exec_res, str) else exec_res
+            if isinstance(data, dict):
+                # Format nicely for display
+                lines = []
+                if "overall_takeaway" in data:
+                    lines.append(f"[bold]Takeaway:[/bold] {data['overall_takeaway']}")
+                if "novel_insights" in data and data["novel_insights"]:
+                    lines.append("\n[bold]Novel Insights:[/bold]")
+                    for insight in data.get("novel_insights", []):
+                        lines.append(f"  • {insight}")
+                if "key_divergences" in data:
+                    lines.append("\n[bold]Key Divergences:[/bold]")
+                    for div in data.get("key_divergences", []):
+                        if isinstance(div, dict):
+                            lines.append(f"  • {div.get('claim', div)}")
+                        else:
+                            lines.append(f"  • {div}")
+                if "debate_arc" in data:
+                    lines.append(f"\n[bold]Arc:[/bold] {data['debate_arc']}")
+                console.print(Panel("\n".join(lines), title="Conversation Summary", border_style="bold blue"))
+                return
+        except Exception:
+            pass
+        console.print(Panel(str(exec_res), title="Conversation Summary", border_style="bold blue"))
 
 
 class SaveNode(Node):
