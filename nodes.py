@@ -328,9 +328,9 @@ class AgentSpeakNode(Node):
         next_speaker = shared[NEXT_SPEAKER]
         personas = shared[PERSONAS]
         conversation = shared[CONVERSATION]
-        topic = shared[TOPIC]
-        moderator_notes = shared.get("moderator_notes")
-
+        # Truncation: for long debates (>25 msgs), keep first 5 + last 15
+        if len(conversation) > 25:
+            conversation = conversation[:5] + conversation[-15:]
         matches = [p for p in personas if p["name"] == next_speaker]
         if not matches:
             persona = personas[0]
