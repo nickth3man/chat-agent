@@ -344,6 +344,12 @@ Argument tendency: {persona.get('argument_tendency', 'Uses logic and evidence')}
 2. PERSONA AUTHENTICITY: What does MY specific background ({persona.get('role','')}) and reasoning approach ({persona.get('reasoning_approach','')}) bring? Lead with personal stance, not generic debate arguments.
 3. PROBE HONESTLY: What vulnerability in the last argument would MY perspective naturally question? Ask genuinely — don't attack.
 
+=== RESPONSE STRUCTURE: TIT-FOR-TAT ===
+1. IDENTIFY the specific claim or assumption in the LAST speaker's message.
+2. CHALLENGE it directly using YOUR reasoning approach ({persona.get('reasoning_approach','')}).
+3. INTRODUCE exactly ONE new angle or edge case they haven't addressed.
+If you cannot find something to genuinely challenge, you're agreeing too much. Force a real point of disagreement from your character's perspective.
+
 === OUTPUT CONSTRAINTS (FOLLOW EXACTLY) ===
 - 120-200 words MAXIMUM. If you exceed 200 words, truncate yourself.
 - NO bullet points, NO numbered lists, NO sign-offs, NO meta-commentary.
