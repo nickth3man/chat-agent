@@ -48,6 +48,9 @@ NOTE_STRATEGIES = [
     "compromise_design",        # Level 6: breakthrough — design synthesis
 ]
 
+# ── YAML formatting rules shared across nodes ──
+YAML_OUTPUT_RULES = """YAML RULES: Use block scalar (|) for multi-line strings. Booleans: 'true'/'false' only. Null: 'null'. Consistent '- ' list indentation. Wrap in ```yaml fences."""
+
 # ── System prompts for each node (Iteration 1: role anchoring) ──
 SYSTEM_INIT = """You are an expert debate designer. Your job is to create psychologically rich,
 distinct personas for multi-sided debates. Each persona must have a unique reasoning
@@ -233,11 +236,22 @@ next_speaker: <name>
 should_end: true/false
 reasoning: <1 line>
 ```"""
-        response = call_llm(prompt, system=SYSTEM_MODERATOR, temperature=MODERATOR_TEMPERATURE, frequency_penalty=MODERATOR_FREQUENCY_PENALTY, presence_penalty=MODERATOR_PRESENCE_PENALTY)
-        data = parse_llm_yaml(response)
-        if "next_speaker" not in data:
-            raise ValueError(f"Invalid moderator response: {response}")
-        return data
+        for attempt in range(3):
+            response = call_llm(prompt, system=SYSTEM_MODERATOR, temperature=MODERATOR_TEMPERATURE, frequency_penalty=MODERATOR_FREQUENCY_PENALTY, presence_penalty=MODERATOR_PRESENCE_PENALTY)
+            try:
+                data = parse_llm_yaml(response)
+            except ValueError as e:
+                if attempt < 2:
+                    prompt += f"\n\nPREVIOUS ATTEMPT FAILED: {e}\nFix the YAML format and retry. {YAML_OUTPUT_RULES}"
+                    continue
+                raise
+            if "next_speaker" not in data:
+                if attempt < 2:
+                    prompt += f"\n\nPREVIOUS ATTEMPT MISSING 'next_speaker'. Fix and retry."
+                    continue
+                raise ValueError(f"Invalid moderator response after 3 attempts: {response}")
+            return data
+        raise ValueError("Moderator YAML parsing failed after 3 attempts")
 
     def exec_fallback(self, prep_res, exc):
         logger.exception("ModeratorNode.exec_fallback triggered: %s", exc)
@@ -314,10 +328,10 @@ class AgentSpeakNode(Node):
         color = AGENT_COLORS[color_idx % len(AGENT_COLORS)]
         research_notes = shared.get(RESEARCH_NOTES, [])
 
-        return persona, conversation, topic, moderator_notes, color, research_notes
+        return persona, conversation, topic, moderator_notes, color, research_notes, shared.get(TURN, 0)
 
     def exec(self, prep_res):
-        persona, conversation, topic, moderator_notes, color, research_notes = prep_res
+        persona, conversation, topic, moderator_notes, color, research_notes, turn = prep_res
 
         conv_str = _conversation_str(conversation)
         mod_line = ""
@@ -359,6 +373,13 @@ If you cannot find something to genuinely challenge, you're agreeing too much. F
 - NO bullet points, NO numbered lists, NO sign-offs, NO meta-commentary.
 - Start mid-argument — no "I think" or "In my opinion" preambles.
 - Stay in character. High belief intensity ({persona.get('belief_intensity',5)}/10): defend firmly. Low: probe and question.
+
+=== DEPTH PROGRESSION (Turn {turn}) ===
+Early turns: establish your position and reasoning surface level.
+Mid turns: explore implications, 2nd-order effects, and hidden assumptions.
+Late turns: synthesize across levels, find new framing, force deeper insight.
+Apply your reasoning approach at the depth appropriate for turn {turn}.
+
 === CONTEXT ===
 TOPIC: {topic}
 
