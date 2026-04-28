@@ -41,7 +41,6 @@ def call_llm(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    body = {
     body: dict = {
         "model": model,
         "messages": messages,
@@ -53,8 +52,6 @@ def call_llm(
         body["frequency_penalty"] = frequency_penalty
     if presence_penalty is not None:
         body["presence_penalty"] = presence_penalty
-    if seed is not None:
-        body["seed"] = seed
 
     response = _get_client().post(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -77,10 +74,9 @@ def call_llm(
         raise PermanentLLMError(f"Unclassified HTTP {status}: {response.text[:500]}")
     response.raise_for_status()
     data = response.json()
-    content = data["choices"][0]["message"]["content"]
-    content = data["choices"][0]["message"]["content"]
+    content = data["choices"][0]["message"].get("content") or ""
     logger.debug("LLM response: len=%d, preview=%r",
-                len(content), content[:200])
+                len(content), content[:200] if content else "<empty>")
     return content
 
 

@@ -237,7 +237,7 @@ reasoning: <1 line>
 
     def exec_fallback(self, prep_res, exc):
         logger.exception("ModeratorNode.exec_fallback triggered: %s", exc)
-        conversation, personas, turn, max_turns, last_speaker, topic, speaker_turns = prep_res
+        conversation, personas, turn, max_turns, last_speaker, topic, speaker_turns, research_count, stall_count = prep_res
         candidates = [p["name"] for p in personas if p["name"] != last_speaker]
         import random
         return {
