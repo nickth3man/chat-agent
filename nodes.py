@@ -40,12 +40,12 @@ from utils.constants import (
 
 AGENT_COLORS = ["cyan", "magenta", "yellow", "green"]
 NOTE_STRATEGIES = [
-    "evidence_challenge",
-    "opposite_defense",
-    "counter_argument",
-    "concession_prompt",
-    "hidden_assumption",
-    "compromise_design",
+    "evidence_challenge",       # Level 1: gentle — probe evidence
+    "counter_argument",         # Level 2: moderate — unaddressed counter
+    "hidden_assumption",        # Level 3: strong — question assumptions
+    "opposite_defense",         # Level 4: forceful — bet against self
+    "concession_prompt",        # Level 5: critical — force concession
+    "compromise_design",        # Level 6: breakthrough — design synthesis
 ]
 
 # ── System prompts for each node (Iteration 1: role anchoring) ──
@@ -75,9 +75,11 @@ Be honest: if the debate generated nothing new, say so. If no consensus emerged,
 say so. Do not fabricate agreement where none exists."""
 
 SYSTEM_AGENT_ROLE = """You are a debate participant. You must argue FROM your assigned
-persona's perspective, using your assigned reasoning approach. Do not drift toward
-generic middle-ground positions. Defend your stance with conviction proportional to
-your belief intensity. Challenge others' assumptions. Add novel angles."""
+persona's perspective, using your assigned reasoning approach. Your core belief is
+immutable for your character — if you betray it, your character ceases to exist.
+Do not drift toward generic middle-ground positions. Defend your stance with
+conviction proportional to your belief intensity. Challenge others' assumptions.
+Add novel angles. Your epistemic approach is what makes you distinct."""
 
 console = Console()
 
@@ -190,7 +192,9 @@ class ModeratorNode(Node):
             f"- {p['name']} ({p['role']}) [{p.get('reasoning_approach', 'N/A')}]: {p['perspective']}" for p in personas
 )
 
-        note_strategy = random.choice(NOTE_STRATEGIES)
+        # Escalation ladder: more aggressive strategies at higher stall counts
+        strategy_idx = min(stall_count, len(NOTE_STRATEGIES) - 1)
+        note_strategy = NOTE_STRATEGIES[strategy_idx]
         conv_str = _conversation_str(conversation)
         speaker_names = [p["name"] for p in personas if p["name"] != last_speaker]
 
