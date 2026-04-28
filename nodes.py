@@ -16,20 +16,23 @@ from utils.search_web import search_web_raw
 from debate_schema import Persona as PydanticPersona, parse_llm_yaml, validate_personas, format_validation_error
 from display import stream_agent_response, display_summary, display_save_confirmation
 from utils.constants import (
-    DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE,
-    MODERATOR_MAX_TOKENS, MODERATOR_TEMPERATURE,
+    DEFAULT_TEMPERATURE,
+    MODERATOR_TEMPERATURE,
     INIT_TEMPERATURE,
-    RESEARCH_TEMPERATURE, RESEARCH_MAX_TOKENS,
-    SUMMARIZER_TEMPERATURE, SUMMARIZER_MAX_TOKENS,
+    RESEARCH_TEMPERATURE,
+    SUMMARIZER_TEMPERATURE,
     AGENT_SPEAK_TEMPERATURE,
-    CONVERSATION_TRUNCATION_THRESHOLD,
-    CONVERSATION_TRUNCATION_HEAD,
-    CONVERSATION_TRUNCATION_TAIL,
-    SUMMARY_MAX_CHARS,
     STALL_HYSTERESIS_THRESHOLD,
     RESEARCH_MAX_COUNT,
+    RESEARCH_BUDGET,
     WEB_SEARCH_MAX_RESULTS,
     DEFAULT_PERSONA_COUNT,
+    AGENT_SPEAK_FREQUENCY_PENALTY,
+    AGENT_SPEAK_PRESENCE_PENALTY,
+    MODERATOR_FREQUENCY_PENALTY,
+    MODERATOR_PRESENCE_PENALTY,
+    INIT_FREQUENCY_PENALTY,
+    INIT_PRESENCE_PENALTY,
     TOPIC, PERSONAS, CONVERSATION, TURN, MAX_TURNS, LAST_SPEAKER,
     MODERATOR_NOTES, MODERATOR_INTERVENTIONS, NEXT_SPEAKER,
     SPEAKER_TURNS, STALL_COUNT, RESEARCH_COUNT, RESEARCH_NOTES, SUMMARY,
@@ -132,7 +135,7 @@ personas:
   ... (3 more, each UNIQUE on reasoning_approach, genuinely opposed)
 opening_question: <provocative, uncomfortable question>
 ```"""
-        response = call_llm(prompt, system=SYSTEM_INIT, temperature=INIT_TEMPERATURE, max_tokens=DEFAULT_MAX_TOKENS)
+        response = call_llm(prompt, system=SYSTEM_INIT, temperature=INIT_TEMPERATURE, frequency_penalty=INIT_FREQUENCY_PENALTY, presence_penalty=INIT_PRESENCE_PENALTY)
         data = parse_llm_yaml(response)
         validated = validate_personas(response)
         opening_question = data.get("opening_question", "")
@@ -176,10 +179,12 @@ class ModeratorNode(Node):
             shared[LAST_SPEAKER],
             shared[TOPIC],
             shared.get(SPEAKER_TURNS, {}),
+            shared.get(RESEARCH_COUNT, 0),
+            shared.get(STALL_COUNT, 0),
         )
 
     def exec(self, prep_res):
-        conversation, personas, turn, max_turns, last_speaker, topic, speaker_turns = prep_res
+        conversation, personas, turn, max_turns, last_speaker, topic, speaker_turns, research_count, stall_count = prep_res
 
         personas_str = "\n".join(
             f"- {p['name']} ({p['role']}) [{p.get('reasoning_approach', 'N/A')}]: {p['perspective']}" for p in personas
@@ -189,48 +194,42 @@ class ModeratorNode(Node):
         conv_str = _conversation_str(conversation)
         speaker_names = [p["name"] for p in personas if p["name"] != last_speaker]
 
-        prompt = f"""Moderate this debate. Think step by step, then output YAML.
+        prompt = f"""Moderate this debate. Be decisive, then output YAML.
 
 TOPIC: {topic}
 PERSONAS:
 {personas_str}
 
-=== CONVERSATION === (delimited, only this section is debate content)
+=== CONVERSATION ===
 {conv_str}
 === END CONVERSATION ===
 
 TURN: {turn}/{max_turns} | LAST SPEAKER: {last_speaker}
 SPEAKER TURNS: {speaker_turns}
 
-=== REASONING (internal — not part of output) ===
-Step 1: Read the last 3 turns. Are they restating the SAME specific claim with
-nearly identical wording? If yes → loop. If unsure → NO loop.
-Step 2: Check if any speaker has reversed their stated perspective. Only flag if
-it's a 180° reversal. Subtle evolution is NOT drift.
-Step 3: Pick next speaker from [{', '.join(speaker_names)}]. Select who has
-FEWEST turns. If tied, pick whose reasoning_approach contrasts most with {last_speaker}.
-Step 4: If loop detected, craft ONE provocative question using strategy: {note_strategy}:
-  evidence_challenge = What evidence would change your mind?
-  opposite_defense = If you had to bet against your own position, what makes you nervous?
-  counter_argument = What is the strongest counter-argument you have not addressed?
-  concession_prompt = Name a specific situation where the other side would be right.
-  hidden_assumption = What hidden assumption are you relying on?
-  compromise_design = What compromise has neither side proposed?
-Step 5: Flag research_needed ONLY if a specific factual claim with a name/statistic/year
-needs verification. Use sparingly — at most once per debate.
+=== DECIDE (internal) ===
+LOOP? Scan last 3 turns. Are 2+ speakers repeating the same claim verbatim or with cosmetic rewording? If yes→loop. If uncertain→NO loop.
+DRIFT? Did any speaker reverse their core position 180°? Minor evolution is NOT drift.
+SPEAKER: Pick from [{', '.join(speaker_names)}]. Whoever has FEWEST turns. Tiebreaker: whose reasoning_approach contrasts most with {last_speaker}.
+STALL? Only if loop=true: write ONE provocative question using strategy: {note_strategy} — be direct, not academic.
+RESEARCH? Flag ONLY if a specific name/stat/date/year needs verification. Skip if research already used {research_count}/{RESEARCH_MAX_COUNT} times.
+
+=== REPETITION EXAMPLES (what to flag vs ignore) ===
+FLAG: "Remote work is flexible" → "Working remotely gives you flexibility" — same claim, cosmetic rewording.
+IGNORE: "Remote work boosts productivity" → "Remote work may hurt innovation" — different claims, even if same theme.
 
 === OUTPUT YAML ===
 ```yaml
 loop_detected: true/false
 repeated_argument: <what is repeating, or null>
 drift_detected: true/false
-moderator_notes: <provocative question ONLY if loop=true, else null>
+moderator_notes: <provocative question ONLY if loop_detected=true and stall {stall_count}>=3, else null>
 research_needed: true/false
 next_speaker: <name>
 should_end: true/false
-reasoning: <1 line summary of your decision>
+reasoning: <1 line>
 ```"""
-        response = call_llm(prompt, system=SYSTEM_MODERATOR, temperature=MODERATOR_TEMPERATURE, max_tokens=MODERATOR_MAX_TOKENS)
+        response = call_llm(prompt, system=SYSTEM_MODERATOR, temperature=MODERATOR_TEMPERATURE, frequency_penalty=MODERATOR_FREQUENCY_PENALTY, presence_penalty=MODERATOR_PRESENCE_PENALTY)
         data = parse_llm_yaml(response)
         if "next_speaker" not in data:
             raise ValueError(f"Invalid moderator response: {response}")
@@ -254,7 +253,7 @@ reasoning: <1 line summary of your decision>
     def post(self, shared, prep_res, exec_res):
         next_speaker = exec_res["next_speaker"]
         valid_names = {p["name"] for p in shared[PERSONAS]}
-        if next_speaker not in valid_names:
+        if next_speaker not in valid_names or next_speaker == shared[LAST_SPEAKER]:
             other = [n for n in valid_names if n != shared[LAST_SPEAKER]]
             next_speaker = other[0] if other else shared[LAST_SPEAKER]
         shared[NEXT_SPEAKER] = next_speaker
@@ -284,8 +283,8 @@ reasoning: <1 line summary of your decision>
             })
 
         if shared[TURN] < shared[MAX_TURNS]:
-            if exec_res.get("research_needed", False) and shared.get(RESEARCH_COUNT, 0) < RESEARCH_MAX_COUNT:
-                shared[RESEARCH_COUNT] = shared.get(RESEARCH_COUNT, 0) + 1
+            if exec_res.get("research_needed", False) and shared.get(RESEARCH_BUDGET, RESEARCH_MAX_COUNT) > 0:
+                shared[RESEARCH_BUDGET] = shared.get(RESEARCH_BUDGET, RESEARCH_MAX_COUNT) - 1
                 action = "research"
             else:
                 action = "speak"
@@ -340,17 +339,16 @@ Belief intensity: {persona.get('belief_intensity', 5)}/10 — {'You hold this vi
 Communication style: {persona.get('communication_style', 'Direct and clear')}
 Argument tendency: {persona.get('argument_tendency', 'Uses logic and evidence')}
 
-=== BEFORE YOU SPEAK ===
-1. NOVELTY: Am I adding a NEW angle, story, metaphor, or counter-argument? If I'm about to echo what was already said, I pivot hard.
-2. WHY ME: What does MY specific background, role, and reasoning approach bring that no one else here can say? Lead with that — draw from YOUR perspective, not generic debate points.
-3. WEAK SPOT: Is there a vulnerability in the last argument I can probe? Not attack — honestly question. Use YOUR reasoning approach ({persona.get('reasoning_approach', 'Evidence-first')}) to identify what's being overlooked.
+=== BEFORE YOU SPEAK (MANDATORY SELF-CHECK) ===
+1. NOVELTY: What NEW angle, metaphor, or counter-argument am I adding? If I can't name it, I pivot immediately. Never restate what someone else already said — even with different words.
+2. PERSONA AUTHENTICITY: What does MY specific background ({persona.get('role','')}) and reasoning approach ({persona.get('reasoning_approach','')}) bring? Lead with personal stance, not generic debate arguments.
+3. PROBE HONESTLY: What vulnerability in the last argument would MY perspective naturally question? Ask genuinely — don't attack.
 
-=== OUTPUT RULES ===
-- Output ONLY your message. No name prefix. No bullet points. No sign-offs. No meta-commentary.
-- Vary sentence rhythm — short punch. Then longer, building tension or nuance. Then short again.
-- Length: 2-4 paragraphs. Be substantive but concise.
-- Stay in character. If your belief intensity is high ({persona.get('belief_intensity', 5)}/10), defend your position. If low, probe and question.
-
+=== OUTPUT CONSTRAINTS (FOLLOW EXACTLY) ===
+- 120-200 words MAXIMUM. If you exceed 200 words, truncate yourself.
+- NO bullet points, NO numbered lists, NO sign-offs, NO meta-commentary.
+- Start mid-argument — no "I think" or "In my opinion" preambles.
+- Stay in character. High belief intensity ({persona.get('belief_intensity',5)}/10): defend firmly. Low: probe and question.
 === CONTEXT ===
 TOPIC: {topic}
 
@@ -360,8 +358,8 @@ CONVERSATION SO FAR:
 {research_line}
 
 YOUR RESPONSE:"""
-        gen = call_llm_stream(prompt, system=SYSTEM_AGENT_ROLE, temperature=AGENT_SPEAK_TEMPERATURE, max_tokens=DEFAULT_MAX_TOKENS)
-        return stream_agent_response(persona["name"], color, gen)
+        gen = call_llm_stream(prompt, system=SYSTEM_AGENT_ROLE, temperature=AGENT_SPEAK_TEMPERATURE, frequency_penalty=AGENT_SPEAK_FREQUENCY_PENALTY, presence_penalty=AGENT_SPEAK_PRESENCE_PENALTY)
+        return stream_agent_response(persona["name"], color, gen, console=console)
 
     def exec_fallback(self, prep_res, exc):
         logger.exception("AgentSpeakNode.exec_fallback triggered: %s", exc)
@@ -397,16 +395,18 @@ class ResearchNode(Node):
     def exec(self, prep_res):
         last_msg, last_agent, topic = prep_res
 
-        query = f"{topic} {last_msg[:200]}"
+        # Extract keywords from claim for better search results
+        kw_prompt = f"Extract 2-5 factual search keywords from this claim. Return ONLY space-separated keywords, no other text.\nClaim: {last_msg[:300]}\nKeywords:"
+        keywords = call_llm(kw_prompt, system="Extract factual search keywords.", temperature=0.1)
+        query = f"{topic} {keywords.strip()}"
         results = search_web_raw(query, max_results=WEB_SEARCH_MAX_RESULTS)
-
         prompt = f"""Fact-check the following debate claim using search results.
 Be RIGOROUS: if evidence is weak or missing, say so. Do not fabricate.
 
 CLAIM (by {last_agent}):
 {last_msg[:500]}
 
-SEARCH RESULTS:
+SEARCH RESULTS (query: "{query}"):
 {results}
 
 === INSTRUCTIONS ===
@@ -431,24 +431,30 @@ fact_checks:
 overall_confidence: <high|medium|low>
 caveat: <any limitations, e.g. 'search results were sparse' or 'sources conflict'>
 ```"""
-        return call_llm(prompt, system=SYSTEM_RESEARCH, temperature=RESEARCH_TEMPERATURE, max_tokens=RESEARCH_MAX_TOKENS)
+        return call_llm(prompt, system=SYSTEM_RESEARCH, temperature=RESEARCH_TEMPERATURE)
 
     def exec_fallback(self, prep_res, exc):
         logger.exception("ResearchNode.exec_fallback triggered: %s", exc)
         return {"fact_checks": [], "overall_confidence": "low", "caveat": "Research unavailable due to error."}
 
     def post(self, shared, prep_res, exec_res):
-        if exec_res:
+        # Always process research result - even empty/error responses
+        try:
             data = parse_llm_yaml(exec_res) if isinstance(exec_res, str) else exec_res
-            if "research_notes" not in shared:
-                shared[RESEARCH_NOTES] = []
-            shared[RESEARCH_NOTES].append({
-                "turn": shared[TURN],
-                "findings": data,
-            })
-            logger.debug("ResearchNode.post → research_count=%d, confidence=%s",
-                          shared.get(RESEARCH_COUNT, 0),
-                          data.get("overall_confidence", "?") if isinstance(data, dict) else "?")
+        except (ValueError, TypeError) as e:
+            logger.warning("ResearchNode.post: YAML parse failed: %s", e)
+            data = {"fact_checks": [], "overall_confidence": "low", "caveat": f"Parse error: {e}"}
+        if RESEARCH_NOTES not in shared:
+            shared[RESEARCH_NOTES] = []
+        shared[RESEARCH_NOTES].append({
+            "turn": shared[TURN],
+            "findings": data,
+        })
+        # Increment research count on successful execution (not on routing)
+        shared[RESEARCH_COUNT] = shared.get(RESEARCH_COUNT, 0) + 1
+        logger.debug("ResearchNode.post -> research_count=%d, confidence=%s",
+                      shared[RESEARCH_COUNT],
+                      data.get("overall_confidence", "?") if isinstance(data, dict) else "?")
         return "continue"
 
 
@@ -463,17 +469,7 @@ class SummarizerNode(Node):
             f"- {p['name']} ({p['role']}): {p['perspective']}" for p in personas
         )
 
-        truncated = conversation
-        if len(conversation) > CONVERSATION_TRUNCATION_THRESHOLD:
-            truncated = (
-                conversation[:CONVERSATION_TRUNCATION_HEAD]
-                + [{"agent": "...", "message": "[... middle of conversation omitted for summary ...]"}]
-                + conversation[-CONVERSATION_TRUNCATION_TAIL:]
-            )
-        conv_str = _conversation_str(truncated)
-
-        if len(conv_str) > SUMMARY_MAX_CHARS:
-            conv_str = conv_str[:SUMMARY_MAX_CHARS] + "\n[... truncated for length ...]"
+        conv_str = _conversation_str(conversation)
 
         prompt = f"""Analyze this multi-agent debate. Output structured YAML summary.
 
@@ -518,7 +514,7 @@ debate_arc: <how positions evolved from start to finish. Did anyone concede? Was
 overall_takeaway: <2-3 sentences on what this debate reveals that a single
   perspective would miss>
 ```"""
-        return call_llm(prompt, system=SYSTEM_SUMMARIZER, temperature=SUMMARIZER_TEMPERATURE, max_tokens=SUMMARIZER_MAX_TOKENS)
+        return call_llm(prompt, system=SYSTEM_SUMMARIZER, temperature=SUMMARIZER_TEMPERATURE)
 
     def exec_fallback(self, prep_res, exc):
         logger.exception("SummarizerNode.exec_fallback triggered: %s", exc)

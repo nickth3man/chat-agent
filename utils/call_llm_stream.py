@@ -12,16 +12,16 @@ def call_llm_stream(
     prompt: str,
     system: str = "",
     temperature: float = 0.8,
-    max_tokens: int = 2048,
     seed: int | None = None,
-):
+    frequency_penalty: float | None = None,
+    presence_penalty: float | None = None,
+) -> object:
     """Stream LLM output with configurable parameters.
 
     Args:
         prompt: The user message to send.
         system: Optional system prompt for role/metacognitive framing.
         temperature: Creativity control (0.0 = deterministic, 1.0 = creative).
-        max_tokens: Maximum output tokens (prevents silent truncation).
         seed: Optional seed for reproducible outputs.
 
     Yields:
@@ -30,23 +30,26 @@ def call_llm_stream(
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("LLM_MODEL", "google/gemini-2.5-flash")
 
-    logger.debug("LLM stream: model=%s, temp=%.2f, max_tokens=%d, prompt_len=%d",
-                model, temperature, max_tokens, len(prompt))
+    logger.debug("LLM stream: model=%s, temp=%.2f, prompt_len=%d",
+                model, temperature, len(prompt))
 
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    body = {
+    body: dict = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
         "stream": True,
     }
     if seed is not None:
         body["seed"] = seed
+    if frequency_penalty is not None:
+        body["frequency_penalty"] = frequency_penalty
+    if presence_penalty is not None:
+        body["presence_penalty"] = presence_penalty
 
     with _get_client().stream(
         "POST",
