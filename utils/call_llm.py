@@ -1,5 +1,14 @@
+import logging
 import os
 import httpx
+from utils.constants import RETRYABLE_HTTP_STATUSES, PERMANENT_HTTP_STATUSES
+from utils.exceptions import PermanentLLMError, RetryableLLMError, RateLimitError
+
+from utils.http_client import _get_client
+
+logger = logging.getLogger(__name__)
+
+
 
 
 def call_llm(
@@ -24,6 +33,9 @@ def call_llm(
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("LLM_MODEL", "google/gemini-2.5-flash")
 
+    logger.debug("LLM call: model=%s, temp=%.2f, max_tokens=%d, prompt_len=%d",
+                model, temperature, max_tokens, len(prompt))
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -38,7 +50,7 @@ def call_llm(
     if seed is not None:
         body["seed"] = seed
 
-    response = httpx.post(
+    response = _get_client().post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -46,9 +58,19 @@ def call_llm(
         },
         json=body,
     )
+
+    status = response.status_code
+    if status in PERMANENT_HTTP_STATUSES:
+        raise PermanentLLMError(f"Permanent HTTP {status}: {response.text[:500]}")
+    if status in RETRYABLE_HTTP_STATUSES:
+        if status == 429:
+            raise RateLimitError(f"Rate limited (429): {response.text[:500]}")
+        raise RetryableLLMError(f"Retryable HTTP {status}: {response.text[:500]}")
     response.raise_for_status()
     data = response.json()
-    return data["choices"][0]["message"]["content"]
+    content = data["choices"][0]["message"]["content"]
+    logger.debug("LLM response: len=%d, preview=%r", len(content), content[:200])
+    return content
 
 
 if __name__ == "__main__":

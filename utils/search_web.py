@@ -6,14 +6,15 @@ Returns:
   list[dict]: [{"title": str, "url": str, "snippet": str}, ...]
 """
 
+import logging
 import time
 from typing import Optional
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
+logger = logging.getLogger(__name__)
+from utils.constants import SEARCH_RATE_LIMIT_INTERVAL
 
 _LAST_CALL = 0.0
-_MIN_INTERVAL = 1.2  # seconds between calls to be polite
-
 
 def search_web(query: str, max_results: int = 5) -> list[dict]:
     """
@@ -29,17 +30,15 @@ def search_web(query: str, max_results: int = 5) -> list[dict]:
     global _LAST_CALL
 
     elapsed = time.monotonic() - _LAST_CALL
-    if elapsed < _MIN_INTERVAL:
-        time.sleep(_MIN_INTERVAL - elapsed)
+    if elapsed < SEARCH_RATE_LIMIT_INTERVAL:
+        time.sleep(SEARCH_RATE_LIMIT_INTERVAL - elapsed)
 
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=min(max_results, 10)))
-    except Exception:
+    except Exception as e:
+        logger.warning("Web search failed for query=%r: %s", query, e)
         results = []
-
-    _LAST_CALL = time.monotonic()
-
     return [
         {
             "title": r.get("title", ""),

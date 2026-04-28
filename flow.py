@@ -3,11 +3,11 @@ from nodes import InitNode, ModeratorNode, AgentSpeakNode, ResearchNode, Summari
 
 
 def create_conversation_flow():
-    init = InitNode()
-    moderator = ModeratorNode(max_retries=2)
-    agent_speak = AgentSpeakNode(max_retries=2)
-    research = ResearchNode(max_retries=1)
-    summarizer = SummarizerNode()
+    init = InitNode(wait=5)
+    moderator = ModeratorNode(max_retries=2, wait=5)
+    agent_speak = AgentSpeakNode(max_retries=2, wait=5)
+    research = ResearchNode(max_retries=1, wait=5)
+    summarizer = SummarizerNode(wait=5)
     save = SaveNode()
 
     init >> moderator

@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 import random
@@ -5,14 +6,34 @@ import re
 from datetime import datetime, timezone
 import yaml
 from rich.console import Console
-from rich.live import Live
-from rich.panel import Panel
-from rich.text import Text
+
+logger = logging.getLogger(__name__)
 
 from pocketflow import Node
 from utils.call_llm import call_llm
 from utils.call_llm_stream import call_llm_stream
 from utils.search_web import search_web_raw
+from debate_schema import Persona as PydanticPersona, parse_llm_yaml, validate_personas, format_validation_error
+from display import stream_agent_response, display_summary, display_save_confirmation
+from utils.constants import (
+    DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE,
+    MODERATOR_MAX_TOKENS, MODERATOR_TEMPERATURE,
+    INIT_TEMPERATURE,
+    RESEARCH_TEMPERATURE, RESEARCH_MAX_TOKENS,
+    SUMMARIZER_TEMPERATURE, SUMMARIZER_MAX_TOKENS,
+    AGENT_SPEAK_TEMPERATURE,
+    CONVERSATION_TRUNCATION_THRESHOLD,
+    CONVERSATION_TRUNCATION_HEAD,
+    CONVERSATION_TRUNCATION_TAIL,
+    SUMMARY_MAX_CHARS,
+    STALL_HYSTERESIS_THRESHOLD,
+    RESEARCH_MAX_COUNT,
+    WEB_SEARCH_MAX_RESULTS,
+    DEFAULT_PERSONA_COUNT,
+    TOPIC, PERSONAS, CONVERSATION, TURN, MAX_TURNS, LAST_SPEAKER,
+    MODERATOR_NOTES, MODERATOR_INTERVENTIONS, NEXT_SPEAKER,
+    SPEAKER_TURNS, STALL_COUNT, RESEARCH_COUNT, RESEARCH_NOTES, SUMMARY,
+)
 
 AGENT_COLORS = ["cyan", "magenta", "yellow", "green"]
 NOTE_STRATEGIES = [
@@ -57,12 +78,7 @@ your belief intensity. Challenge others' assumptions. Add novel angles."""
 
 console = Console()
 
-
-def _parse_yaml(text: str) -> dict:
-    match = re.search(r"```yaml\s*(.*?)\s*```", text, re.DOTALL)
-    if match:
-        return yaml.safe_load(match.group(1))
-    return yaml.safe_load(text)
+# Backward-compat alias for tests — delegates to debate_schema's parser
 
 
 def _conversation_str(conversation: list) -> str:
@@ -74,10 +90,10 @@ def _conversation_str(conversation: list) -> str:
 
 class InitNode(Node):
     def prep(self, shared):
-        return shared["topic"]
+        return shared[TOPIC]
 
     def exec(self, topic):
-        prompt = f"""Design 4 debate personas for: "{topic}"
+        prompt = f"""Design {DEFAULT_PERSONA_COUNT} debate personas for: "{topic}"
 
 Each persona must represent a GENUINELY DIFFERENT position that SHARPLY DISAGREES
 with others. Do NOT generate 4 moderate voices who converge on reasonable middle ground.
@@ -116,21 +132,16 @@ personas:
   ... (3 more, each UNIQUE on reasoning_approach, genuinely opposed)
 opening_question: <provocative, uncomfortable question>
 ```"""
-        response = call_llm(prompt, system=SYSTEM_INIT, temperature=0.9, max_tokens=2048)
-        data = _parse_yaml(response)
-        if "personas" not in data or "opening_question" not in data:
-            raise ValueError(f"Invalid init response: {response}")
-        for p in data["personas"]:
-            required = ("name", "role", "perspective", "reasoning_approach", "belief_intensity", "communication_style", "argument_tendency")
-            if not all(k in p for k in required):
-                raise ValueError(f"Persona missing required fields: {p}")
-            if len(str(p.get("role", ""))) < 2 or len(str(p.get("role", ""))) > 60:
-                raise ValueError(f"Persona role must be 2-60 chars (job title): {p}")
-            if len(str(p.get("perspective", ""))) < 15:
-                raise ValueError(f"Persona perspective too short (<15 chars): {p}")
-        return data
+        response = call_llm(prompt, system=SYSTEM_INIT, temperature=INIT_TEMPERATURE, max_tokens=DEFAULT_MAX_TOKENS)
+        data = parse_llm_yaml(response)
+        validated = validate_personas(response)
+        opening_question = data.get("opening_question", "")
+        personas = [p.model_dump() for p in validated]
+        logger.info("InitNode: generated %d personas", len(personas))
+        return {"personas": personas, "opening_question": opening_question}
 
     def exec_fallback(self, prep_res, exc):
+        logger.exception("InitNode.exec_fallback triggered: %s", exc)
         return {
             "personas": [
                 {"name": "Alex", "role": "Techno-Optimist", "perspective": "Technology will solve humanity's biggest problems if we embrace innovation without fear. We need less regulation, not more.", "reasoning_approach": "Evidence-first", "belief_intensity": 8, "communication_style": "Cites historical tech breakthroughs as proof of pattern", "argument_tendency": "Compares regulatory pushback to past Luddite movements"},
@@ -142,28 +153,29 @@ opening_question: <provocative, uncomfortable question>
         }
 
     def post(self, shared, prep_res, exec_res):
-        shared["personas"] = exec_res["personas"]
-        shared["conversation"] = [
+        shared[PERSONAS] = exec_res["personas"]
+        shared[CONVERSATION] = [
             {"agent": exec_res["personas"][0]["name"], "message": exec_res["opening_question"]}
         ]
-        shared["turn"] = 1
-        shared["last_speaker"] = exec_res["personas"][0]["name"]
-        shared["moderator_notes"] = None
-        shared["moderator_interventions"] = []
+        shared[TURN] = 1
+        shared[LAST_SPEAKER] = exec_res["personas"][0]["name"]
+        shared[MODERATOR_NOTES] = None
+        shared[MODERATOR_INTERVENTIONS] = []
         turns = {p["name"]: 0 for p in exec_res["personas"]}
         turns[exec_res["personas"][0]["name"]] = 1
-        shared["speaker_turns"] = turns
-
+        shared[SPEAKER_TURNS] = turns
+        logger.debug("InitNode.post → turn=1, speaker=%s, %d personas",
+                      shared[LAST_SPEAKER], len(shared[PERSONAS]))
 class ModeratorNode(Node):
     def prep(self, shared):
         return (
-            shared["conversation"],
-            shared["personas"],
-            shared["turn"],
-            shared["max_turns"],
-            shared["last_speaker"],
-            shared["topic"],
-            shared.get("speaker_turns", {}),
+            shared[CONVERSATION],
+            shared[PERSONAS],
+            shared[TURN],
+            shared[MAX_TURNS],
+            shared[LAST_SPEAKER],
+            shared[TOPIC],
+            shared.get(SPEAKER_TURNS, {}),
         )
 
     def exec(self, prep_res):
@@ -218,13 +230,14 @@ next_speaker: <name>
 should_end: true/false
 reasoning: <1 line summary of your decision>
 ```"""
-        response = call_llm(prompt, system=SYSTEM_MODERATOR, temperature=0.3, max_tokens=1024)
-        data = _parse_yaml(response)
+        response = call_llm(prompt, system=SYSTEM_MODERATOR, temperature=MODERATOR_TEMPERATURE, max_tokens=MODERATOR_MAX_TOKENS)
+        data = parse_llm_yaml(response)
         if "next_speaker" not in data:
             raise ValueError(f"Invalid moderator response: {response}")
         return data
 
     def exec_fallback(self, prep_res, exc):
+        logger.exception("ModeratorNode.exec_fallback triggered: %s", exc)
         conversation, personas, turn, max_turns, last_speaker, topic, speaker_turns = prep_res
         candidates = [p["name"] for p in personas if p["name"] != last_speaker]
         import random
@@ -240,48 +253,53 @@ reasoning: <1 line summary of your decision>
 
     def post(self, shared, prep_res, exec_res):
         next_speaker = exec_res["next_speaker"]
-        valid_names = {p["name"] for p in shared["personas"]}
+        valid_names = {p["name"] for p in shared[PERSONAS]}
         if next_speaker not in valid_names:
-            other = [n for n in valid_names if n != shared["last_speaker"]]
-            next_speaker = other[0] if other else shared["last_speaker"]
-        shared["next_speaker"] = next_speaker
+            other = [n for n in valid_names if n != shared[LAST_SPEAKER]]
+            next_speaker = other[0] if other else shared[LAST_SPEAKER]
+        shared[NEXT_SPEAKER] = next_speaker
         loop_detected = exec_res.get("loop_detected", False)
 
         # Stall counter with hysteresis (MagenticOne pattern)
-        stall = shared.get("stall_count", 0)
+        stall = shared.get(STALL_COUNT, 0)
         if loop_detected:
             stall += 1
         else:
             stall = max(0, stall - 1)
-        shared["stall_count"] = stall
+        shared[STALL_COUNT] = stall
 
-        # Only pass notes when stall threshold reached (3+)
+        # Only pass notes when stall threshold reached
         notes = None
-        if stall >= 3:
+        if stall >= STALL_HYSTERESIS_THRESHOLD:
             notes = exec_res.get("moderator_notes")
-        shared["moderator_notes"] = notes if notes else None
+        shared[MODERATOR_NOTES] = notes if notes else None
 
         if notes:
-            shared["moderator_interventions"].append({
-                "turn": shared["turn"],
+            shared[MODERATOR_INTERVENTIONS].append({
+                "turn": shared[TURN],
                 "loop_detected": loop_detected,
                 "drift_detected": exec_res.get("drift_detected", False),
                 "note": notes,
                 "stall_count": stall,
             })
 
-        if shared["turn"] < shared["max_turns"]:
-            if exec_res.get("research_needed", False) and shared.get("research_count", 0) < 2:
-                shared["research_count"] = shared.get("research_count", 0) + 1
-                return "research"
-            return "speak"
-        return "summarize"
+        if shared[TURN] < shared[MAX_TURNS]:
+            if exec_res.get("research_needed", False) and shared.get(RESEARCH_COUNT, 0) < RESEARCH_MAX_COUNT:
+                shared[RESEARCH_COUNT] = shared.get(RESEARCH_COUNT, 0) + 1
+                action = "research"
+            else:
+                action = "speak"
+        else:
+            action = "summarize"
+        logger.debug("ModeratorNode.post → action=%s, speaker=%s, stall=%d, turn=%d/%d",
+                      action, next_speaker, stall, shared[TURN], shared[MAX_TURNS])
+        return action
 class AgentSpeakNode(Node):
     def prep(self, shared):
-        next_speaker = shared["next_speaker"]
-        personas = shared["personas"]
-        conversation = shared["conversation"]
-        topic = shared["topic"]
+        next_speaker = shared[NEXT_SPEAKER]
+        personas = shared[PERSONAS]
+        conversation = shared[CONVERSATION]
+        topic = shared[TOPIC]
         moderator_notes = shared.get("moderator_notes")
 
         matches = [p for p in personas if p["name"] == next_speaker]
@@ -291,7 +309,7 @@ class AgentSpeakNode(Node):
             persona = matches[0]
         color_idx = next(i for i, p in enumerate(personas) if p["name"] == persona["name"])
         color = AGENT_COLORS[color_idx % len(AGENT_COLORS)]
-        research_notes = shared.get("research_notes", [])
+        research_notes = shared.get(RESEARCH_NOTES, [])
 
         return persona, conversation, topic, moderator_notes, color, research_notes
 
@@ -306,6 +324,8 @@ class AgentSpeakNode(Node):
         research_line = ""
         if research_notes:
             latest = research_notes[-1].get("findings", {})
+            if not isinstance(latest, dict):
+                latest = {}
             facts_text = str(latest.get("facts", []))[:500]
             ctx = latest.get("relevant_context", "")
             if facts_text:
@@ -340,42 +360,27 @@ CONVERSATION SO FAR:
 {research_line}
 
 YOUR RESPONSE:"""
-        full_text = ""
-
-        with Live(
-            Panel("", title=persona["name"], border_style=color),
-            console=console,
-            refresh_per_second=15,
-            transient=False,
-        ) as live:
-            gen = call_llm_stream(prompt, system=SYSTEM_AGENT_ROLE, temperature=0.85, max_tokens=2048)
-            while True:
-                try:
-                    chunk = next(gen)
-                    full_text += chunk
-                    live.update(
-                        Panel(full_text, title=persona["name"], border_style=color)
-                    )
-                except StopIteration:
-                    break
-
-        return full_text
+        gen = call_llm_stream(prompt, system=SYSTEM_AGENT_ROLE, temperature=AGENT_SPEAK_TEMPERATURE, max_tokens=DEFAULT_MAX_TOKENS)
+        return stream_agent_response(persona["name"], color, gen)
 
     def exec_fallback(self, prep_res, exc):
+        logger.exception("AgentSpeakNode.exec_fallback triggered: %s", exc)
         persona = prep_res[0]
         return f"[{persona['name']} is unable to respond right now. Error: {exc}]"
 
     def post(self, shared, prep_res, exec_res):
         persona = prep_res[0]
-        shared["conversation"].append({
+        shared[CONVERSATION].append({
             "agent": persona["name"],
             "message": exec_res,
         })
-        shared["last_speaker"] = persona["name"]
-        shared["moderator_notes"] = None
-        shared["turn"] += 1
+        shared[LAST_SPEAKER] = persona["name"]
+        shared[MODERATOR_NOTES] = None
+        shared[TURN] += 1
         if "speaker_turns" in shared:
-            shared["speaker_turns"][persona["name"]] = shared["speaker_turns"].get(persona["name"], 0) + 1
+            shared[SPEAKER_TURNS][persona["name"]] = shared[SPEAKER_TURNS].get(persona["name"], 0) + 1
+        logger.debug("AgentSpeakNode.post → speaker=%s, turn=%d, msg_len=%d",
+                      persona["name"], shared[TURN], len(exec_res))
         return "continue"
 
 
@@ -383,17 +388,17 @@ class ResearchNode(Node):
     """Search the web for facts related to the last claim in the debate."""
 
     def prep(self, shared):
-        conversation = shared["conversation"]
+        conversation = shared[CONVERSATION]
         last_msg = conversation[-1]["message"] if conversation else ""
         last_agent = conversation[-1]["agent"] if conversation else ""
-        topic = shared["topic"]
+        topic = shared[TOPIC]
         return last_msg, last_agent, topic
 
     def exec(self, prep_res):
         last_msg, last_agent, topic = prep_res
 
         query = f"{topic} {last_msg[:200]}"
-        results = search_web_raw(query, max_results=3)
+        results = search_web_raw(query, max_results=WEB_SEARCH_MAX_RESULTS)
 
         prompt = f"""Fact-check the following debate claim using search results.
 Be RIGOROUS: if evidence is weak or missing, say so. Do not fabricate.
@@ -426,26 +431,30 @@ fact_checks:
 overall_confidence: <high|medium|low>
 caveat: <any limitations, e.g. 'search results were sparse' or 'sources conflict'>
 ```"""
-        return call_llm(prompt, system=SYSTEM_RESEARCH, temperature=0.2, max_tokens=1536)
+        return call_llm(prompt, system=SYSTEM_RESEARCH, temperature=RESEARCH_TEMPERATURE, max_tokens=RESEARCH_MAX_TOKENS)
 
     def exec_fallback(self, prep_res, exc):
-        return None
+        logger.exception("ResearchNode.exec_fallback triggered: %s", exc)
+        return {"fact_checks": [], "overall_confidence": "low", "caveat": "Research unavailable due to error."}
 
     def post(self, shared, prep_res, exec_res):
         if exec_res:
-            data = _parse_yaml(exec_res) if isinstance(exec_res, str) else exec_res
+            data = parse_llm_yaml(exec_res) if isinstance(exec_res, str) else exec_res
             if "research_notes" not in shared:
-                shared["research_notes"] = []
-            shared["research_notes"].append({
-                "turn": shared["turn"],
+                shared[RESEARCH_NOTES] = []
+            shared[RESEARCH_NOTES].append({
+                "turn": shared[TURN],
                 "findings": data,
             })
+            logger.debug("ResearchNode.post → research_count=%d, confidence=%s",
+                          shared.get(RESEARCH_COUNT, 0),
+                          data.get("overall_confidence", "?") if isinstance(data, dict) else "?")
         return "continue"
 
 
 class SummarizerNode(Node):
     def prep(self, shared):
-        return shared["conversation"], shared["personas"], shared["topic"]
+        return shared[CONVERSATION], shared[PERSONAS], shared[TOPIC]
 
     def exec(self, prep_res):
         conversation, personas, topic = prep_res
@@ -455,16 +464,16 @@ class SummarizerNode(Node):
         )
 
         truncated = conversation
-        if len(conversation) > 30:
+        if len(conversation) > CONVERSATION_TRUNCATION_THRESHOLD:
             truncated = (
-                conversation[:10]
+                conversation[:CONVERSATION_TRUNCATION_HEAD]
                 + [{"agent": "...", "message": "[... middle of conversation omitted for summary ...]"}]
-                + conversation[-15:]
+                + conversation[-CONVERSATION_TRUNCATION_TAIL:]
             )
         conv_str = _conversation_str(truncated)
 
-        if len(conv_str) > 8000:
-            conv_str = conv_str[:8000] + "\n[... truncated for length ...]"
+        if len(conv_str) > SUMMARY_MAX_CHARS:
+            conv_str = conv_str[:SUMMARY_MAX_CHARS] + "\n[... truncated for length ...]"
 
         prompt = f"""Analyze this multi-agent debate. Output structured YAML summary.
 
@@ -509,51 +518,27 @@ debate_arc: <how positions evolved from start to finish. Did anyone concede? Was
 overall_takeaway: <2-3 sentences on what this debate reveals that a single
   perspective would miss>
 ```"""
-        return call_llm(prompt, system=SYSTEM_SUMMARIZER, temperature=0.5, max_tokens=4096)
+        return call_llm(prompt, system=SYSTEM_SUMMARIZER, temperature=SUMMARIZER_TEMPERATURE, max_tokens=SUMMARIZER_MAX_TOKENS)
 
     def exec_fallback(self, prep_res, exc):
+        logger.exception("SummarizerNode.exec_fallback triggered: %s", exc)
         return "Summary could not be generated due to an error."
 
     def post(self, shared, prep_res, exec_res):
-        shared["summary"] = exec_res
-        console.print()
-        # Parse YAML if present, otherwise display raw text
-        try:
-            data = _parse_yaml(exec_res) if isinstance(exec_res, str) else exec_res
-            if isinstance(data, dict):
-                # Format nicely for display
-                lines = []
-                if "overall_takeaway" in data:
-                    lines.append(f"[bold]Takeaway:[/bold] {data['overall_takeaway']}")
-                if "novel_insights" in data and data["novel_insights"]:
-                    lines.append("\n[bold]Novel Insights:[/bold]")
-                    for insight in data.get("novel_insights", []):
-                        lines.append(f"  • {insight}")
-                if "key_divergences" in data:
-                    lines.append("\n[bold]Key Divergences:[/bold]")
-                    for div in data.get("key_divergences", []):
-                        if isinstance(div, dict):
-                            lines.append(f"  • {div.get('claim', div)}")
-                        else:
-                            lines.append(f"  • {div}")
-                if "debate_arc" in data:
-                    lines.append(f"\n[bold]Arc:[/bold] {data['debate_arc']}")
-                console.print(Panel("\n".join(lines), title="Conversation Summary", border_style="bold blue"))
-                return
-        except Exception:
-            pass
-        console.print(Panel(str(exec_res), title="Conversation Summary", border_style="bold blue"))
+        shared[SUMMARY] = exec_res
+        logger.debug("SummarizerNode.post → summary_len=%d", len(exec_res))
+        display_summary(exec_res, console)
 
 
 class SaveNode(Node):
     def prep(self, shared):
         return {
-            "topic": shared["topic"],
-            "personas": shared["personas"],
-            "conversation": shared["conversation"],
-            "turn_count": shared["turn"],
-            "moderator_interventions": shared.get("moderator_interventions", []),
-            "summary": shared["summary"],
+            "topic": shared[TOPIC],
+            "personas": shared[PERSONAS],
+            "conversation": shared[CONVERSATION],
+            "turn_count": shared[TURN],
+            "moderator_interventions": shared.get(MODERATOR_INTERVENTIONS, []),
+            "summary": shared[SUMMARY],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -576,8 +561,9 @@ class SaveNode(Node):
         return filepath
 
     def exec_fallback(self, prep_res, exc):
-        return None
+        logger.exception("SaveNode.exec_fallback triggered: %s", exc)
+        return ""
 
     def post(self, shared, prep_res, exec_res):
         if exec_res:
-            console.print(f"\n[dim]Conversation saved to {exec_res}[/dim]")
+            display_save_confirmation(exec_res, console)

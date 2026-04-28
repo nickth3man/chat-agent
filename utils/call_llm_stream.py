@@ -1,6 +1,11 @@
 import os
+import logging
 import json
 import httpx
+
+from utils.http_client import _get_client
+
+logger = logging.getLogger(__name__)
 
 
 def call_llm_stream(
@@ -25,6 +30,9 @@ def call_llm_stream(
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("LLM_MODEL", "google/gemini-2.5-flash")
 
+    logger.debug("LLM stream: model=%s, temp=%.2f, max_tokens=%d, prompt_len=%d",
+                model, temperature, max_tokens, len(prompt))
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -40,7 +48,7 @@ def call_llm_stream(
     if seed is not None:
         body["seed"] = seed
 
-    with httpx.stream(
+    with _get_client().stream(
         "POST",
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -65,6 +73,7 @@ def call_llm_stream(
                         yield content
                 except (json.JSONDecodeError, KeyError):
                     continue
+        # return sets StopIteration.value — used by callers that consume the full generator
         return full_text
 
 
