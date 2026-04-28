@@ -276,6 +276,13 @@ reasoning: <1 line>
             next_speaker = other[0] if other else shared[LAST_SPEAKER]
         shared[NEXT_SPEAKER] = next_speaker
         loop_detected = exec_res.get("loop_detected", False)
+        drift_detected = exec_res.get("drift_detected", False)
+        
+        # INFO-level logging for moderator decisions (was DEBUG-only)
+        logger.info("Moderator: speaker=%s loop=%s drift=%s stall=%d reasoning=%s",
+                    next_speaker, loop_detected, drift_detected,
+                    shared.get(STALL_COUNT, 0),
+                    exec_res.get("reasoning", "?"))
 
         # Stall counter with hysteresis (MagenticOne pattern)
         stall = shared.get(STALL_COUNT, 0)
@@ -290,6 +297,11 @@ reasoning: <1 line>
         if stall >= STALL_HYSTERESIS_THRESHOLD:
             notes = exec_res.get("moderator_notes")
         shared[MODERATOR_NOTES] = notes if notes else None
+
+        # Devil's advocate: when severely stalled (>=4), force opposite-position argument
+        if stall >= 4 and notes:
+            notes = f"{notes} ALSO: For this turn only, argue AGAINST your position — find the strongest opposing argument and defend it."
+            shared[MODERATOR_NOTES] = notes
 
         if notes:
             shared[MODERATOR_INTERVENTIONS].append({
@@ -399,9 +411,15 @@ YOUR RESPONSE:"""
 
     def post(self, shared, prep_res, exec_res):
         persona = prep_res[0]
+        # Guard: skip zero-length messages (pollute conversation, confuse moderator)
+        msg = exec_res.strip() if exec_res else ""
+        if not msg:
+            logger.warning("AgentSpeakNode.post: skipping zero-length message from %s", persona["name"])
+            shared[MODERATOR_NOTES] = None
+            return "continue"
         shared[CONVERSATION].append({
             "agent": persona["name"],
-            "message": exec_res,
+            "message": msg,
         })
         shared[LAST_SPEAKER] = persona["name"]
         shared[MODERATOR_NOTES] = None
